@@ -17,6 +17,15 @@
 #include "webview/api.h"
 
 /* ============================================================
+   Thread safety: webview requires the main thread
+   ============================================================ */
+
+#define REQUIRE_MAIN_THREAD(ctx) do { \
+    if (get_thread_num() != 0) \
+        RP_THROW(ctx, "webview: must be used from the main thread"); \
+} while(0)
+
+/* ============================================================
    Data structures
    ============================================================ */
 
@@ -173,6 +182,7 @@ static duk_ret_t wv_finalizer(duk_context *ctx)
 
 static duk_ret_t wv_constructor(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     if (!duk_is_constructor_call(ctx))
         RP_THROW(ctx, "WebView must be called with 'new'");
 
@@ -261,6 +271,7 @@ static duk_ret_t wv_constructor(duk_context *ctx)
 
 static duk_ret_t wv_set_title(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     const char *title = REQUIRE_STRING(ctx, 0,
         "webview.setTitle(): argument must be a string");
@@ -270,6 +281,7 @@ static duk_ret_t wv_set_title(duk_context *ctx)
 
 static duk_ret_t wv_set_size(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     int width = REQUIRE_INT(ctx, 0,
         "webview.setSize(): first argument (width) must be a number");
@@ -295,6 +307,7 @@ static duk_ret_t wv_set_size(duk_context *ctx)
 
 static duk_ret_t wv_navigate(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     const char *url = REQUIRE_STRING(ctx, 0,
         "webview.navigate(): argument must be a string (URL)");
@@ -306,6 +319,7 @@ static duk_ret_t wv_navigate(duk_context *ctx)
 
 static duk_ret_t wv_set_html(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     const char *html = REQUIRE_STRING(ctx, 0,
         "webview.setHtml(): argument must be a string (HTML)");
@@ -317,6 +331,7 @@ static duk_ret_t wv_set_html(duk_context *ctx)
 
 static duk_ret_t wv_init_js(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     const char *js = REQUIRE_STRING(ctx, 0,
         "webview.init(): argument must be a string (JavaScript)");
@@ -328,6 +343,7 @@ static duk_ret_t wv_init_js(duk_context *ctx)
 
 static duk_ret_t wv_eval(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     const char *js = REQUIRE_STRING(ctx, 0,
         "webview.eval(): argument must be a string (JavaScript)");
@@ -339,6 +355,7 @@ static duk_ret_t wv_eval(duk_context *ctx)
 
 static duk_ret_t wv_bind(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     const char *name = REQUIRE_STRING(ctx, 0,
         "webview.bind(): first argument must be a string (function name)");
     REQUIRE_FUNCTION(ctx, 1,
@@ -383,6 +400,7 @@ static duk_ret_t wv_bind(duk_context *ctx)
 
 static duk_ret_t wv_unbind(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     const char *name = REQUIRE_STRING(ctx, 0,
         "webview.unbind(): argument must be a string (function name)");
     webview_t w = get_wv(ctx);
@@ -402,6 +420,7 @@ static duk_ret_t wv_unbind(duk_context *ctx)
 
 static duk_ret_t wv_run(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     webview_error_t err = webview_run(w);
     if (WEBVIEW_FAILED(err))
@@ -411,6 +430,7 @@ static duk_ret_t wv_run(duk_context *ctx)
 
 static duk_ret_t wv_terminate(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     webview_t w = get_wv(ctx);
     webview_terminate(w);
     return 0;
@@ -418,6 +438,7 @@ static duk_ret_t wv_terminate(duk_context *ctx)
 
 static duk_ret_t wv_destroy(duk_context *ctx)
 {
+    REQUIRE_MAIN_THREAD(ctx);
     duk_push_this(ctx);
 
     if (!duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("wv"))) {
