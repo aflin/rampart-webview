@@ -1516,11 +1516,13 @@ static duk_ret_t jsctx_require(duk_context *ctx)
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    /* Wrap: (function(module,exports){<code>\nreturn module.exports;})
-             ({exports:{}},{})                                          */
-    const char *prefix = "(function(module,exports,require){\n";
+    /* Wrap in a CommonJS shim.  exports must be the same object as
+       module.exports so that UMD factories that populate either one
+       both end up in the return value. */
+    const char *prefix = "(function(require){"
+                         "var module={exports:{}},exports=module.exports;\n";
     const char *suffix = "\nreturn module.exports;\n"
-                         "})({exports:{}},{exports:{}},function(){})";
+                         "})(function(){})";
     size_t plen = strlen(prefix);
     size_t slen = strlen(suffix);
     char *wrapped = (char *)malloc(plen + (size_t)len + slen + 1);
