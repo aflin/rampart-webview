@@ -61,13 +61,26 @@ if(APPLE)
     )
 endif()
 
-# ---- Copy test script to build directory ----
+# ---- Copy test scripts and library fixtures to build directory ----
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/test_webview.js"
     "${CMAKE_CURRENT_BINARY_DIR}/test_webview.js"
     COPYONLY
 )
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/webview-jsc-test.js"
+    "${CMAKE_CURRENT_BINARY_DIR}/webview-jsc-test.js"
+    COPYONLY
+)
+
+file(GLOB JSC_TEST_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/libs/*.js")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/libs")
+foreach(libfile ${JSC_TEST_LIBS})
+    get_filename_component(fname "${libfile}" NAME)
+    configure_file("${libfile}" "${CMAKE_CURRENT_BINARY_DIR}/libs/${fname}" COPYONLY)
+endforeach()
 
 # ---- Install ----
 
