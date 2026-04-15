@@ -380,7 +380,15 @@ var lib = jsc.getGlobal("LibraryName");
 Load a JavaScript file with a CommonJS-compatible shim.  The file is wrapped in
 a `function(module, exports, require){ ... }` closure and `module.exports` is
 returned.  This works with UMD bundles and CommonJS modules, which covers most
-npm packages.
+npm packages.  There is also limited, experimental support for ES module syntax
+(`export default`, `export function`, `export { ... }`, etc.) — if the CommonJS
+shim fails with a SyntaxError, `require` will attempt to transform `export`
+statements automatically.
+
+Both CommonJS and ESM support expect **single-file bundles**.  Multi-file
+modules with `import` or `require` dependencies between files are not resolved.
+Use a bundler (e.g., `esbuild lib.js --bundle --format=cjs`) to produce a
+single file first.
 
 ```javascript
 var math = jsc.require("/path/to/math.js");

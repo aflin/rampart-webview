@@ -1502,6 +1502,341 @@ static duk_ret_t jsctx_load_script(duk_context *ctx)
     return 1;
 }
 
+/* --- ESM → CommonJS transform (best-effort, for bundled ESM files) ---
+ *
+ * Rewrites export statements to module.exports assignments.
+ * Only used as a fallback when the CommonJS shim fails.
+ *
+ * Handles:
+ *   export default <expr>         → module.exports = <expr>
+ *   export function <name>(       → function <name>(  + collected
+ *   export class <name>           → class <name>      + collected
+ *   export const/let/var <names>  → const/let/var     + collected
+ *   export { a, b, c }           → collected
+ *   export { a as b }            → collected with alias
+ *   import ... from '...'        → stripped (deps unavailable)
+ *   import '...'                 → stripped
+ *
+ * Tracks quote/comment state to avoid false positives.
+ * Returns a malloc'd transformed string, or NULL if no exports found.
+ */
+
+/* Append to a dynamic buffer, growing as needed */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} dbuf_t;
+
+static void dbuf_init(dbuf_t *d, size_t initial)
+{
+    d->cap = initial;
+    d->buf = (char *)malloc(d->cap);
+    d->len = 0;
+    if (d->buf) d->buf[0] = '\0';
+}
+
+static void dbuf_append(dbuf_t *d, const char *s, size_t n)
+{
+    if (!d->buf) return;
+    if (d->len + n + 1 > d->cap) {
+        d->cap = (d->len + n + 1) * 2;
+        d->buf = (char *)realloc(d->buf, d->cap);
+        if (!d->buf) return;
+    }
+    memcpy(d->buf + d->len, s, n);
+    d->len += n;
+    d->buf[d->len] = '\0';
+}
+
+static void dbuf_puts(dbuf_t *d, const char *s)
+{
+    dbuf_append(d, s, strlen(s));
+}
+
+/* Skip whitespace, return pointer to first non-space */
+static const char *skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+/* Read an identifier from p into buf (max buflen-1 chars), return end ptr */
+static const char *read_ident(const char *p, char *buf, size_t buflen)
+{
+    size_t i = 0;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+           (*p >= '0' && *p <= '9') || *p == '_' || *p == '$') {
+        if (i < buflen - 1) buf[i++] = *p;
+        p++;
+    }
+    buf[i] = '\0';
+    return p;
+}
+
+/* Collected export names: "module.exports.name = name;\n" appended at end */
+typedef struct {
+    dbuf_t names; /* accumulated assignment lines */
+    int    count;
+} esm_exports_t;
+
+static void esm_collect(esm_exports_t *ex, const char *name, const char *alias)
+{
+    const char *local = name;
+    const char *exported = alias ? alias : name;
+    dbuf_puts(&ex->names, "module.exports.");
+    dbuf_puts(&ex->names, exported);
+    dbuf_puts(&ex->names, " = ");
+    dbuf_puts(&ex->names, local);
+    dbuf_puts(&ex->names, ";\n");
+    ex->count++;
+}
+
+static char *esm_to_cjs(const char *src, size_t srclen)
+{
+    dbuf_t out;
+    dbuf_init(&out, srclen + 1024);
+    esm_exports_t ex;
+    dbuf_init(&ex.names, 512);
+    ex.count = 0;
+
+    /* CJS prefix — wrapped in IIFE to isolate module scope */
+    dbuf_puts(&out, "(function(){var module={exports:{}},exports=module.exports;\n");
+
+    const char *p = src;
+    const char *end = src + srclen;
+
+    /* Track comment state only — quote tracking is intentionally
+       omitted because regex literals (e.g. /it's/) can contain
+       unmatched quotes that corrupt the parser state.  Comments
+       are unambiguous (/​/ and /​* *​/) and sufficient to avoid
+       false positives on commented-out export statements. */
+    int in_line_comment = 0;
+    int in_block_comment = 0;
+
+    while (p < end) {
+        if (in_line_comment) {
+            if (*p == '\n') in_line_comment = 0;
+            dbuf_append(&out, p, 1);
+            p++;
+            continue;
+        }
+        if (in_block_comment) {
+            if (*p == '*' && p + 1 < end && *(p+1) == '/') {
+                in_block_comment = 0;
+                dbuf_append(&out, p, 2);
+                p += 2;
+            } else {
+                dbuf_append(&out, p, 1);
+                p++;
+            }
+            continue;
+        }
+        if (*p == '/' && p + 1 < end) {
+            if (*(p+1) == '/') {
+                in_line_comment = 1;
+                dbuf_append(&out, p, 2);
+                p += 2;
+                continue;
+            }
+            if (*(p+1) == '*') {
+                in_block_comment = 1;
+                dbuf_append(&out, p, 2);
+                p += 2;
+                continue;
+            }
+        }
+
+        /* --- Check for export/import at start of statement --- */
+        int at_stmt = 0;
+        if (p == src) {
+            at_stmt = 1;
+        } else {
+            const char *back = p - 1;
+            while (back >= src && (*back == ' ' || *back == '\t')) back--;
+            if (back < src || *back == '\n' || *back == '\r' ||
+                *back == ';' || *back == '{' || *back == '}')
+                at_stmt = 1;
+        }
+
+        if (!at_stmt) {
+            dbuf_append(&out, p, 1);
+            p++;
+            continue;
+        }
+
+        /* --- import ... --- */
+        if (p + 6 < end && strncmp(p, "import", 6) == 0 &&
+            (p[6] == ' ' || p[6] == '\t' || p[6] == '\'' || p[6] == '"')) {
+            /* Skip the entire import statement/line */
+            while (p < end && *p != '\n' && *p != ';') p++;
+            if (p < end && *p == ';') p++;
+            if (p < end && *p == '\n') p++;
+            dbuf_puts(&out, "/* import stripped */\n");
+            continue;
+        }
+
+        /* --- export ... --- */
+        if (p + 6 < end && strncmp(p, "export", 6) == 0 &&
+            (p[6] == ' ' || p[6] == '\t' || p[6] == '{')) {
+            const char *after = skip_ws(p + 6);
+
+            /* export default */
+            if (strncmp(after, "default", 7) == 0 &&
+                (after[7] == ' ' || after[7] == '\t' || after[7] == '\n' ||
+                 after[7] == '(' || after[7] == '{')) {
+                dbuf_puts(&out, "module.exports = ");
+                p = skip_ws(after + 7);
+                continue;
+            }
+
+            /* export function <name> */
+            if (strncmp(after, "function", 8) == 0 &&
+                (after[8] == ' ' || after[8] == '*')) {
+                const char *np = skip_ws(after + 8);
+                if (*np == '*') np = skip_ws(np + 1); /* generator */
+                char name[128];
+                read_ident(np, name, sizeof(name));
+                if (name[0]) esm_collect(&ex, name, NULL);
+                /* Emit without 'export' */
+                dbuf_puts(&out, "function ");
+                p = after + 8;
+                continue;
+            }
+
+            /* export class <name> */
+            if (strncmp(after, "class", 5) == 0 &&
+                (after[5] == ' ' || after[5] == '\t')) {
+                const char *np = skip_ws(after + 5);
+                char name[128];
+                read_ident(np, name, sizeof(name));
+                if (name[0]) esm_collect(&ex, name, NULL);
+                dbuf_puts(&out, "class ");
+                p = after + 5;
+                continue;
+            }
+
+            /* export const/let/var <name> */
+            int is_decl = 0;
+            int kw_len = 0;
+            if (strncmp(after, "const ", 6) == 0) { is_decl = 1; kw_len = 5; }
+            else if (strncmp(after, "let ", 4) == 0) { is_decl = 1; kw_len = 3; }
+            else if (strncmp(after, "var ", 4) == 0) { is_decl = 1; kw_len = 3; }
+            if (is_decl) {
+                const char *np = skip_ws(after + kw_len);
+                /* Could be destructuring: export const { a, b } = ...
+                   or simple: export const name = ... */
+                if (*np == '{') {
+                    /* Destructuring — collect names from braces */
+                    np++;
+                    while (np < end && *np != '}') {
+                        np = skip_ws(np);
+                        char name[128];
+                        np = read_ident(np, name, sizeof(name));
+                        if (name[0]) esm_collect(&ex, name, NULL);
+                        np = skip_ws(np);
+                        if (*np == ',') np++;
+                    }
+                } else {
+                    /* Simple or comma-separated: const a = 1, b = 2
+                       Collect each name; skip values by tracking
+                       nesting depth to ignore commas in expressions. */
+                    for (;;) {
+                        np = skip_ws(np);
+                        char name[128];
+                        np = read_ident(np, name, sizeof(name));
+                        if (name[0]) esm_collect(&ex, name, NULL);
+                        /* Skip past the value to the next comma or end */
+                        int depth = 0;
+                        while (np < end) {
+                            if ((*np == ',' && depth == 0) ||
+                                (*np == ';' && depth == 0) ||
+                                (*np == '\n' && depth == 0))
+                                break;
+                            if (*np == '(' || *np == '[' || *np == '{')
+                                depth++;
+                            else if (*np == ')' || *np == ']' || *np == '}')
+                                depth--;
+                            else if (*np == '\'' || *np == '"' || *np == '`') {
+                                char q = *np++;
+                                while (np < end && *np != q) {
+                                    if (*np == '\\' && np + 1 < end) np++;
+                                    np++;
+                                }
+                            }
+                            np++;
+                        }
+                        if (*np == ',') { np++; continue; }
+                        break;
+                    }
+                }
+                /* Emit the declaration without 'export' */
+                dbuf_append(&out, after, (size_t)kw_len);
+                dbuf_append(&out, " ", 1);
+                p = after + kw_len;
+                continue;
+            }
+
+            /* export { name1, name2, name3 as alias } */
+            if (*after == '{') {
+                const char *bp = after + 1;
+                while (bp < end && *bp != '}') {
+                    bp = skip_ws(bp);
+                    char name[128];
+                    bp = read_ident(bp, name, sizeof(name));
+                    bp = skip_ws(bp);
+                    /* Check for 'as alias' */
+                    if (strncmp(bp, "as ", 3) == 0) {
+                        bp = skip_ws(bp + 3);
+                        char alias[128];
+                        bp = read_ident(bp, alias, sizeof(alias));
+                        if (name[0]) esm_collect(&ex, name, alias[0] ? alias : NULL);
+                    } else {
+                        if (name[0]) esm_collect(&ex, name, NULL);
+                    }
+                    bp = skip_ws(bp);
+                    if (*bp == ',') bp++;
+                }
+                if (*bp == '}') bp++;
+                /* Skip optional 'from "..."' (re-exports — can't resolve) */
+                bp = skip_ws(bp);
+                if (strncmp(bp, "from", 4) == 0) {
+                    while (bp < end && *bp != '\n' && *bp != ';') bp++;
+                }
+                if (bp < end && *bp == ';') bp++;
+                if (bp < end && *bp == '\n') bp++;
+                p = bp;
+                continue;
+            }
+
+            /* Unrecognized export form — pass through */
+            dbuf_append(&out, p, 1);
+            p++;
+            continue;
+        }
+
+        /* Regular character */
+        dbuf_append(&out, p, 1);
+        p++;
+    }
+
+    if (ex.count == 0) {
+        /* No exports found — not an ESM file */
+        free(out.buf);
+        free(ex.names.buf);
+        return NULL;
+    }
+
+    /* Append collected export assignments + return statement */
+    dbuf_puts(&out, "\n");
+    if (ex.names.buf && ex.names.len > 0)
+        dbuf_append(&out, ex.names.buf, ex.names.len);
+    dbuf_puts(&out, "return module.exports;\n})()\n");
+
+    free(ex.names.buf);
+    return out.buf;
+}
+
 /* --- .require(path) — load script with CommonJS shim, return exports --- */
 
 static duk_ret_t jsctx_require(duk_context *ctx)
@@ -1515,22 +1850,24 @@ static duk_ret_t jsctx_require(duk_context *ctx)
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
+    char *raw = (char *)malloc((size_t)len + 1);
+    if (!raw) { fclose(f); RP_THROW(ctx, "out of memory"); }
+    size_t nr = fread(raw, 1, (size_t)len, f);
+    fclose(f);
+    raw[nr] = '\0';
 
-    /* Wrap in a CommonJS shim.  exports must be the same object as
-       module.exports so that UMD factories that populate either one
-       both end up in the return value. */
+    /* --- Attempt 1: CommonJS shim --- */
     const char *prefix = "(function(require){"
                          "var module={exports:{}},exports=module.exports;\n";
     const char *suffix = "\nreturn module.exports;\n"
                          "})(function(){})";
     size_t plen = strlen(prefix);
     size_t slen = strlen(suffix);
-    char *wrapped = (char *)malloc(plen + (size_t)len + slen + 1);
-    if (!wrapped) { fclose(f); RP_THROW(ctx, "out of memory"); }
+    char *wrapped = (char *)malloc(plen + nr + slen + 1);
+    if (!wrapped) { free(raw); RP_THROW(ctx, "out of memory"); }
 
     memcpy(wrapped, prefix, plen);
-    size_t nr = fread(wrapped + plen, 1, (size_t)len, f);
-    fclose(f);
+    memcpy(wrapped + plen, raw, nr);
     memcpy(wrapped + plen + nr, suffix, slen);
     wrapped[plen + nr + slen] = '\0';
 
@@ -1540,11 +1877,50 @@ static duk_ret_t jsctx_require(duk_context *ctx)
     free(wrapped);
 
     if (pctx->exception) {
+        /* Check if it was a SyntaxError — if so, try ESM transform */
+        const char *ename = jsc_exception_get_name(pctx->exception);
+        int is_syntax = (ename && strcmp(ename, "SyntaxError") == 0);
+
         if (result) g_object_unref(result);
+        result = NULL;
+
+        if (is_syntax) {
+            g_object_unref(pctx->exception);
+            pctx->exception = NULL;
+
+            /* --- Attempt 2: ESM → CJS transform --- */
+            char *esm = esm_to_cjs(raw, nr);
+            free(raw);
+            raw = NULL;
+
+            if (esm) {
+                jsc_pctx_clear(pctx);
+                result = jsc_context_evaluate_with_source_uri(
+                    pctx->ctx, esm, (gssize)strlen(esm), path, 1);
+                free(esm);
+
+                if (pctx->exception) {
+                    if (result) g_object_unref(result);
+                    jsc_check_and_throw(ctx, pctx);
+                    return 0;
+                }
+
+                jsc_wrap_value(ctx, pctx, result);
+                g_object_unref(result);
+                return 1;
+            }
+            /* esm_to_cjs returned NULL — no exports found, not ESM */
+            RP_THROW(ctx, "JSCContext.require(): SyntaxError in '%s' "
+                     "(not a CommonJS or ES module)", path);
+        }
+
+        /* Non-syntax error — throw it */
+        free(raw);
         jsc_check_and_throw(ctx, pctx);
         return 0;
     }
 
+    free(raw);
     jsc_wrap_value(ctx, pctx, result);
     g_object_unref(result);
     return 1;
