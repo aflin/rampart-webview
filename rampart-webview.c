@@ -819,7 +819,9 @@ typedef struct jsc_pctx_s {
     JSCContext   *ctx;        /* the JavaScriptCore context            */
     JSCException *exception;  /* last captured exception (or NULL)     */
     int           refcount;   /* prevented from being freed while      */
-} jsc_pctx_t;                /* wrapped values still reference it     */
+    pid_t         pid;        /* process that created this context     */
+    int           thread_num; /* thread that created this context      */
+} jsc_pctx_t;                /* (JSC is not thread-safe or fork-safe) */
 
 static void jsc_pctx_exc_handler(JSCContext *context,
                                   JSCException *exception,
@@ -839,9 +841,26 @@ static jsc_pctx_t *jsc_pctx_new(void)
     p->ctx = jsc_context_new();
     if (!p->ctx) { free(p); return NULL; }
     p->refcount = 1;
+    p->pid = getpid();
+    p->thread_num = get_thread_num();
     jsc_context_push_exception_handler(p->ctx,
         jsc_pctx_exc_handler, p, NULL);
     return p;
+}
+
+/* Verify we're in the same process AND thread that created the context.
+   JSC contexts are single-threaded and use background threads (JIT, GC)
+   that are not fork-safe. */
+static void jsc_check_pid(duk_context *ctx, jsc_pctx_t *p)
+{
+    if (p->pid != getpid())
+        RP_THROW(ctx, "JSCContext: cannot be used after fork() or daemon() "
+                 "(created in pid %d, current pid %d)",
+                 (int)p->pid, (int)getpid());
+    if (p->thread_num != get_thread_num())
+        RP_THROW(ctx, "JSCContext: cannot be used from a different thread "
+                 "(created in thread %d, current thread %d)",
+                 p->thread_num, get_thread_num());
 }
 
 static jsc_pctx_t *jsc_pctx_ref(jsc_pctx_t *p)  { p->refcount++; return p; }
@@ -1109,6 +1128,7 @@ static duk_ret_t jsc_func_call(duk_context *ctx)
     jsc_pctx_t *pctx = get_jscval_pctx(ctx, fn);
     if (!pctx || !pctx->ctx)
         RP_THROW(ctx, "JSCContext: context has been destroyed");
+    jsc_check_pid(ctx, pctx);
 
     /* Parent object + method name (for correct 'this' binding) */
     JSCValue *parent = NULL;
@@ -1183,6 +1203,7 @@ static duk_ret_t jsc_proxy_get(duk_context *ctx)
 
     jsc_pctx_t *pctx = get_jscval_pctx(ctx, 0);
     if (!pctx || !pctx->ctx) return 0;
+    jsc_check_pid(ctx, pctx);
 
     /* Look up the property in JSC */
     if (!jsc_value_object_has_property(obj, key))
@@ -1408,7 +1429,7 @@ static duk_ret_t jsctx_constructor(duk_context *ctx)
     return 0;
 }
 
-/* Helper: get pctx from 'this' */
+/* Helper: get pctx from 'this' and verify we're in the right process */
 static jsc_pctx_t *jsctx_get_pctx(duk_context *ctx, const char *method)
 {
     duk_push_this(ctx);
@@ -1420,6 +1441,7 @@ static jsc_pctx_t *jsctx_get_pctx(duk_context *ctx, const char *method)
     duk_pop_2(ctx);
     if (!p || !p->ctx)
         RP_THROW(ctx, "JSCContext.%s(): context has been destroyed", method);
+    jsc_check_pid(ctx, p);
     return p;
 }
 
