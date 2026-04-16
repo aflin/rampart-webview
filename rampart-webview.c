@@ -15,7 +15,14 @@
 #endif
 #include "rampart.h"
 #include "webview/api.h"
+
+/* JSC headless features are only available on platforms with WebKitGTK
+   (Linux, and potentially macOS).  Windows uses WebView2 which does
+   not expose a standalone JavaScriptCore API. */
+#if !defined(_WIN32) && !defined(__CYGWIN__)
+#define HAVE_JSC 1
 #include <jsc/jsc.h>
+#endif
 
 /* ============================================================
    Tagged-JSON: rich type serialization across the webview bind
@@ -720,6 +727,7 @@ static duk_ret_t wv_destroy(duk_context *ctx)
     return 0;
 }
 
+#ifdef HAVE_JSC
 /* ============================================================
    Headless JavaScriptCore execution
    ============================================================ */
@@ -2234,6 +2242,8 @@ static duk_ret_t jsctx_destroy(duk_context *ctx)
     return 0;
 }
 
+#endif /* HAVE_JSC */
+
 /* ============================================================
    Module entry point
    ============================================================ */
@@ -2297,6 +2307,7 @@ duk_ret_t duk_open_module(duk_context *ctx)
     /* Put constructor as "WebView" on module object */
     duk_put_prop_string(ctx, mod_idx, "WebView");
 
+#ifdef HAVE_JSC
     /* Headless JSC one-shot evaluation */
     duk_push_c_function(ctx, jsc_exec, 1);
     duk_put_prop_string(ctx, mod_idx, "jscExec");
@@ -2327,6 +2338,7 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_put_prop_string(ctx, jsc_con, "prototype");
     duk_put_prop_string(ctx, mod_idx, "JSCContext");
+#endif /* HAVE_JSC */
 
     /* Expose hint constants on the module object */
     duk_push_int(ctx, WEBVIEW_HINT_NONE);
