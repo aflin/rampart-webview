@@ -18,6 +18,10 @@ var w = new webview.WebView({
   <button onclick="testGreet()">Call greet("World")</button>\
   <div id="greet-result" style="margin-top:10px; font-size:18px; color:green;"></div>\
   <hr>\
+  <h3>Snapshot Test</h3>\
+  <button onclick="testSnapshot()">Capture Screenshot</button>\
+  <div id="snap-result" style="margin-top:10px; font-size:18px; color:purple;"></div>\
+  <hr>\
   <button onclick="window.quit()" style="margin-top:20px; padding:10px 20px; font-size:16px;">Quit</button>\
   <script>\
     async function testAdd() {\
@@ -36,6 +40,14 @@ var w = new webview.WebView({
         document.getElementById("greet-result").textContent = "Error: " + e;\
       }\
     }\
+    async function testSnapshot() {\
+      try {\
+        var res = await window.snapshot();\
+        document.getElementById("snap-result").textContent = res;\
+      } catch(e) {\
+        document.getElementById("snap-result").textContent = "Error: " + e;\
+      }\
+    }\
   </script>\
 </body>\
 </html>'
@@ -52,6 +64,28 @@ w.bind("greet", function(name) {
     console.log("greet() called with", name);
     return "Hello, " + name + "!";
 });
+
+// Bind a snapshot function (Linux/macOS only — not available on Windows)
+if (typeof w.snapshot === "function") {
+    w.bind("snapshot", function() {
+        console.log("snapshot() called");
+        try {
+            var png = w.snapshot();
+            var path = "/tmp/webview_test_snapshot.png";
+            rampart.utils.fprintf(path, "%s", png);
+            var msg = "Saved " + png.length + " bytes to " + path;
+            console.log(msg);
+            return msg;
+        } catch(e) {
+            console.log("snapshot error:", e.message);
+            return "Error: " + e.message;
+        }
+    });
+} else {
+    w.bind("snapshot", function() {
+        return "snapshot() not available on this platform";
+    });
+}
 
 // Bind a quit function
 w.bind("quit", function() {

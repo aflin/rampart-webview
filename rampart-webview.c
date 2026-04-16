@@ -731,6 +731,155 @@ static duk_ret_t wv_destroy(duk_context *ctx)
     return 0;
 }
 
+/* ============================================================
+   Snapshot: capture the webview as a PNG buffer
+   ============================================================ */
+
+#if (defined(__linux__) || defined(__unix__)) && !defined(_WIN32) && !defined(__APPLE__)
+#include <webkit2/webkit2.h>
+#include <cairo/cairo.h>
+
+/* PNG write callback: collect data into a dynamic buffer */
+typedef struct {
+    unsigned char *data;
+    size_t         len;
+    size_t         cap;
+} png_buf_t;
+
+static cairo_status_t png_write_cb(void *closure,
+                                   const unsigned char *data,
+                                   unsigned int length)
+{
+    png_buf_t *buf = (png_buf_t *)closure;
+    if (buf->len + length > buf->cap) {
+        buf->cap = (buf->len + length) * 2;
+        buf->data = (unsigned char *)realloc(buf->data, buf->cap);
+        if (!buf->data) return CAIRO_STATUS_WRITE_ERROR;
+    }
+    memcpy(buf->data + buf->len, data, length);
+    buf->len += length;
+    return CAIRO_STATUS_SUCCESS;
+}
+
+/* Async snapshot callback */
+typedef struct {
+    cairo_surface_t *surface;
+    int               done;
+    GError           *error;
+} snapshot_state_t;
+
+static void snapshot_ready_cb(GObject *source, GAsyncResult *res,
+                               gpointer user_data)
+{
+    snapshot_state_t *st = (snapshot_state_t *)user_data;
+    st->surface = webkit_web_view_get_snapshot_finish(
+        WEBKIT_WEB_VIEW(source), res, &st->error);
+    st->done = 1;
+}
+
+static duk_ret_t wv_snapshot(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    webview_t w = get_wv(ctx);
+
+    /* Get the WebKitWebView native handle */
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle)
+        RP_THROW(ctx, "webview.snapshot(): failed to get browser handle");
+
+    WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
+
+    /* Check for optional region argument */
+    WebKitSnapshotRegion region = WEBKIT_SNAPSHOT_REGION_VISIBLE;
+    if (duk_is_string(ctx, 0)) {
+        const char *r = duk_get_string(ctx, 0);
+        if (!strcmp(r, "full"))
+            region = WEBKIT_SNAPSHOT_REGION_FULL_DOCUMENT;
+    }
+
+    /* Start async snapshot and pump the main loop until it completes */
+    snapshot_state_t st = { NULL, 0, NULL };
+    webkit_web_view_get_snapshot(wk, region,
+        WEBKIT_SNAPSHOT_OPTIONS_NONE, NULL, snapshot_ready_cb, &st);
+    while (!st.done)
+        g_main_context_iteration(NULL, TRUE);
+
+    if (st.error || !st.surface) {
+        const char *msg = st.error ? st.error->message : "unknown error";
+        if (st.error) g_error_free(st.error);
+        RP_THROW(ctx, "webview.snapshot(): %s", msg);
+    }
+
+    /* Encode cairo surface as PNG into a buffer */
+    png_buf_t png = { NULL, 0, 0 };
+    png.cap = 4096;
+    png.data = (unsigned char *)malloc(png.cap);
+    if (!png.data) {
+        cairo_surface_destroy(st.surface);
+        RP_THROW(ctx, "webview.snapshot(): out of memory");
+    }
+
+    cairo_status_t cs = cairo_surface_write_to_png_stream(
+        st.surface, png_write_cb, &png);
+    cairo_surface_destroy(st.surface);
+
+    if (cs != CAIRO_STATUS_SUCCESS || !png.data) {
+        free(png.data);
+        RP_THROW(ctx, "webview.snapshot(): PNG encoding failed");
+    }
+
+    /* Push as a Node.js Buffer */
+    void *buf = duk_push_fixed_buffer(ctx, png.len);
+    memcpy(buf, png.data, png.len);
+    free(png.data);
+    duk_push_buffer_object(ctx, -1, 0, png.len, DUK_BUFOBJ_NODEJS_BUFFER);
+    duk_remove(ctx, -2);
+
+    return 1;
+}
+
+#define HAVE_SNAPSHOT 1
+
+#elif defined(__APPLE__)
+
+/* macOS: use WKWebView's snapshot API via Objective-C helper */
+extern unsigned char *rp_wkwebview_snapshot(void *wkwebview,
+                                            int full_document,
+                                            size_t *out_len);
+
+static duk_ret_t wv_snapshot(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle)
+        RP_THROW(ctx, "webview.snapshot(): failed to get browser handle");
+
+    int full = 0;
+    if (duk_is_string(ctx, 0) && !strcmp(duk_get_string(ctx, 0), "full"))
+        full = 1;
+
+    size_t png_len = 0;
+    unsigned char *png_data = rp_wkwebview_snapshot(handle, full, &png_len);
+    if (!png_data || png_len == 0)
+        RP_THROW(ctx, "webview.snapshot(): failed to capture screenshot");
+
+    void *buf = duk_push_fixed_buffer(ctx, png_len);
+    memcpy(buf, png_data, png_len);
+    free(png_data);
+    duk_push_buffer_object(ctx, -1, 0, png_len, DUK_BUFOBJ_NODEJS_BUFFER);
+    duk_remove(ctx, -2);
+
+    return 1;
+}
+
+#define HAVE_SNAPSHOT 1
+
+#endif /* snapshot platform */
+
 #ifdef HAVE_JSC
 /* ============================================================
    Headless JavaScriptCore execution
@@ -2304,6 +2453,11 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, wv_destroy, 0);
     duk_put_prop_string(ctx, -2, "destroy");
+
+#ifdef HAVE_SNAPSHOT
+    duk_push_c_function(ctx, wv_snapshot, DUK_VARARGS);
+    duk_put_prop_string(ctx, -2, "snapshot");
+#endif
 
     /* Set prototype on constructor */
     duk_put_prop_string(ctx, con_idx, "prototype");

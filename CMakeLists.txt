@@ -23,7 +23,11 @@ set(WEBVIEW_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview")
 set(WEBVIEW_INCLUDE_DIR "${WEBVIEW_SOURCE_DIR}/core/include")
 
 # The module shared library
-add_library(rampart-webview SHARED rampart-webview.c)
+if(APPLE)
+    add_library(rampart-webview SHARED rampart-webview.c snapshot_macos.m)
+else()
+    add_library(rampart-webview SHARED rampart-webview.c)
+endif()
 
 # Output must always be rampart-webview.so regardless of platform.
 # Use C++ linker because libwebview.a contains C++ object code.

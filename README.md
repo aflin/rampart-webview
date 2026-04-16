@@ -201,6 +201,71 @@ automatically by the garbage collector if the object goes out of scope.
 w.destroy();
 ```
 
+#### w.snapshot([region])
+
+Capture the webview's rendered content as a PNG image and return it as a
+:green:`Buffer`.  Available on Linux (via WebKitGTK) and macOS (via WKWebView).
+Not available on Windows.
+
+```javascript
+var png = w.snapshot();          // visible region only
+var fullPng = w.snapshot("full"); // entire document, including scrolled-off content
+rampart.utils.fprintf("page.png", "%s", png);
+```
+
+The optional `region` argument can be `"full"` to capture the entire document
+(including content below the fold).  Default is the visible window region.
+
+Typical use is inside a bound callback after the page has finished loading:
+
+```javascript
+w.bind("ready", function() {
+    var png = w.snapshot();
+    // ... save or process png ...
+    w.terminate();
+});
+w.setHtml('<body><h1>Hello</h1>\
+    <script>window.addEventListener("load",function(){window.ready()})</script>\
+    </body>');
+w.run();
+```
+
+Combined with the `headless.sh` helper script (see
+[Running Without a Display](#running-without-a-display) below), this enables
+automated screenshot generation and visual testing without a GUI session.
+
+### Running Without a Display
+
+The webview requires a display connection (X11 on Linux, Cocoa/WindowServer
+on macOS).  For automated tasks that don't need a visible window — such as
+generating screenshots or running bound callbacks — you can use a virtual
+display.
+
+**Linux:** The included `headless.sh` script wraps rampart with Xvfb (X virtual
+framebuffer).  Install Xvfb first:
+
+```bash
+sudo apt install xvfb     # Debian/Ubuntu
+sudo dnf install xorg-x11-server-Xvfb   # Fedora/RHEL
+```
+
+Then run any webview script headlessly:
+
+```bash
+./headless.sh my_script.js
+./headless.sh --dim 1920x1080 my_script.js
+```
+
+The webview renders fully inside the virtual display — `w.snapshot()` and all
+bound callbacks work normally.
+
+**macOS:** Headless operation is not directly supported because Cocoa
+applications require an active WindowServer (login session).  CI services
+like GitHub Actions and CircleCI handle this by keeping a user logged in on
+their macOS runners.
+
+**Windows:** Not supported.
+
 ### Constants
 
 | Constant | Value | Description |
@@ -274,9 +339,10 @@ This module also provides direct access to the JavaScriptCore (JSC) engine
 that ships with WebKitGTK, allowing you to execute modern JavaScript (ES2020+)
 without a GUI.  This gives Rampart access to a full JIT-compiled JS engine for
 running third-party libraries that require features beyond Duktape's ES5.1
-support.  **Note:** The JSC features are available on Linux and macOS only.
-On Windows, the module provides the WebView GUI functionality but not the
-headless JSC functions (`jscExec`, `JSCContext`).
+support.  **Note:** The JSC features are available on Linux (via WebKitGTK)
+and macOS (via the system JavaScriptCore.framework).  On Windows, the module
+provides the WebView GUI functionality but not the headless JSC functions
+(`jscExec`, `JSCContext`).
 
 There are two interfaces: `jscExec()` for one-shot evaluation, and
 `JSCContext` for a persistent interpreter where you can load modules, maintain
