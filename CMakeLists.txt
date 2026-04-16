@@ -4,8 +4,19 @@ project(rampart-webview C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Rampart include path
+# Detect MSYS/Cygwin compiler (CMAKE_SYSTEM_NAME may be forced to Windows)
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    execute_process(
+        COMMAND ${CMAKE_C_COMPILER} -dumpmachine
+        OUTPUT_VARIABLE GCC_TARGET_TRIPLE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(GCC_TARGET_TRIPLE MATCHES "cygwin|msys")
+        set(MSYS_COMPILER TRUE)
+    endif()
+endif()
+
+# Rampart paths
 set(RAMPART_INCLUDE "/usr/local/rampart/include" CACHE PATH "Rampart include directory")
+set(RAMPART_BIN "/usr/local/rampart/bin" CACHE PATH "Rampart bin directory (for import library)")
 
 # Webview paths
 set(WEBVIEW_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview")
@@ -46,6 +57,12 @@ set(WEBVIEW_ENABLE_CHECKS OFF CACHE BOOL "" FORCE)
 
 if(WIN32 OR CYGWIN OR MSYS)
     set(WEBVIEW_USE_COMPAT_MINGW ON CACHE BOOL "" FORCE)
+    # MSYS2/Cygwin report CMAKE_SYSTEM_NAME as "MSYS" or "CYGWIN"
+    # rather than "Windows", causing the webview cmake to look for
+    # WebKitGTK instead of WebView2.  Force the correct platform.
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        set(CMAKE_SYSTEM_NAME "Windows")
+    endif()
 endif()
 
 add_subdirectory(webview)
@@ -59,6 +76,9 @@ if(APPLE)
     set_target_properties(rampart-webview PROPERTIES
         LINK_FLAGS "-undefined dynamic_lookup"
     )
+elseif(MSYS_COMPILER)
+    # Link against rampart import library to resolve duktape symbols
+    target_link_libraries(rampart-webview PRIVATE "${RAMPART_BIN}/librampart.dll.a")
 endif()
 
 # ---- Copy test scripts and library fixtures to build directory ----
