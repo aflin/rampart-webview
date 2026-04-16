@@ -1,6 +1,12 @@
 /* make printf et. al. global */
 rampart.globalize(rampart.utils);
 
+if (rampart.buildPlatform.indexOf("windows") !== -1 ||
+    rampart.buildPlatform.indexOf("MSYS") !== -1) {
+    printf("JSC tests skipped: JavaScriptCore is not available on Windows.\n");
+    process.exit(0);
+}
+
 var wv = require("rampart-webview");
 
 var _nfailed = 0;

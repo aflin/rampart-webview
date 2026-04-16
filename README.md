@@ -274,7 +274,9 @@ This module also provides direct access to the JavaScriptCore (JSC) engine
 that ships with WebKitGTK, allowing you to execute modern JavaScript (ES2020+)
 without a GUI.  This gives Rampart access to a full JIT-compiled JS engine for
 running third-party libraries that require features beyond Duktape's ES5.1
-support.
+support.  **Note:** The JSC features are available on Linux and macOS only.
+On Windows, the module provides the WebView GUI functionality but not the
+headless JSC functions (`jscExec`, `JSCContext`).
 
 There are two interfaces: `jscExec()` for one-shot evaluation, and
 `JSCContext` for a persistent interpreter where you can load modules, maintain
