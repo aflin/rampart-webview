@@ -154,8 +154,10 @@ async function doAdd() {
 </script>
 ```
 
-The callback can return any JSON-serializable value (numbers, strings, objects,
-arrays, booleans, null). If the callback throws an error, the Promise in the
+The callback can accept and return rich types including numbers, strings,
+objects, arrays, booleans, null, Dates, Buffers/ArrayBuffers, TypedArrays,
+RegExps, Maps, Sets, NaN, Infinity, and undefined.  Cyclic object references
+are also preserved.  If the callback throws an error, the Promise in the
 webview is rejected with the error message.
 
 #### w.unbind(name)

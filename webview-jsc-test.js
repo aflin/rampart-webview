@@ -69,12 +69,14 @@ testFeature("jscExec - ArrayBuffer", function() {
 
 testFeature("jscExec - Map", function() {
     var m = wv.jscExec("new Map([['a',1],['b',2]])");
-    return JSON.stringify(m) === '[["a",1],["b",2]]';
+    return m instanceof Map && m.size === 2
+        && m.get("a") === 1 && m.get("b") === 2;
 });
 
 testFeature("jscExec - Set", function() {
     var s = wv.jscExec("new Set([10,20,30,10])");
-    return JSON.stringify(s) === '[10,20,30]';
+    return s instanceof Set && s.size === 3
+        && s.has(10) && s.has(30) && !s.has(99);
 });
 
 testFeature("jscExec - nested object", function() {

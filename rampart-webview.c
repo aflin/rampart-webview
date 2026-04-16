@@ -18,6 +18,198 @@
 #include <jsc/jsc.h>
 
 /* ============================================================
+   Tagged-JSON: rich type serialization across the webview bind
+   protocol.  Both sides (Duktape and browser JS) encode special
+   types as {__t:"X", ...} objects within the JSON.
+   ============================================================ */
+
+/* Duktape-side encoder: value → tagged value (before JSON stringify).
+   Stored in the global stash as "rp_wv_encode". */
+static const char rp_wv_encode_js[] =
+    "(function __enc(v,seen,paths,path){"
+    "if(v===void 0)return{__t:'U'};"
+    "if(v===null)return null;"
+    "if(typeof v==='boolean'||typeof v==='string')return v;"
+    "if(typeof v==='number'){"
+      "if(v!==v)return{__t:'N'};"
+      "if(v===1/0)return{__t:'I',s:1};"
+      "if(v===-1/0)return{__t:'I',s:-1};"
+      "return v;"
+    "}"
+    "if(typeof v!=='object')return v;"
+    "if(!seen){seen=[];paths=[];path='$'}"
+    "var idx=seen.indexOf(v);"
+    "if(idx!==-1)return{_cyclic_ref:paths[idx]};"
+    "seen.push(v);paths.push(path);"
+    "if(v instanceof Date)return{__t:'D',v:v.getTime()};"
+    "if(v instanceof RegExp)return{__t:'R',s:v.source,f:v.flags||''};"
+    "if(typeof Map!=='undefined'&&v instanceof Map){"
+      "var a=[];v.forEach(function(val,key){"
+        "a.push([__enc(key,seen,paths,path),__enc(val,seen,paths,path)])"
+      "});return{__t:'M',v:a};"
+    "}"
+    "if(typeof Set!=='undefined'&&v instanceof Set){"
+      "var a=[];v.forEach(function(val){"
+        "a.push(__enc(val,seen,paths,path))"
+      "});return{__t:'S',v:a};"
+    "}"
+    "if(typeof Buffer!=='undefined'&&Buffer.isBuffer(v))"
+      "return{__t:'B',v:Duktape.enc('base64',v)};"
+    "if(v instanceof ArrayBuffer||ArrayBuffer.isView(v)){"
+      "var u8=ArrayBuffer.isView(v)?"
+        "new Uint8Array(v.buffer,v.byteOffset,v.byteLength):"
+        "new Uint8Array(v);"
+      "return{__t:'B',v:Duktape.enc('base64',u8)};"
+    "}"
+    "if(Array.isArray(v))return v.map(function(x,i){return __enc(x,seen,paths,path+'['+i+']')});"
+    "var r={},k=Object.keys(v),i;"
+    "for(i=0;i<k.length;i++)r[k[i]]=__enc(v[k[i]],seen,paths,path+'.'+k[i]);"
+    "return r;"
+    "})";
+
+/* Duktape-side decoder: tagged value → real value (after JSON parse).
+   Stored in the global stash as "rp_wv_decode". */
+/* Duktape-side decoder: modifies values in-place so that restored
+   cyclic references (from Phase 1) are preserved.  Uses a seen array
+   to avoid infinite recursion on cyclic objects. */
+static const char rp_wv_decode_js[] =
+    "(function __dec(v,seen){"
+    "if(v===null||typeof v!=='object')return v;"
+    "if(v.__t)switch(v.__t){"
+      "case'D':return new Date(v.v);"
+      "case'B':return new Buffer(Duktape.dec('base64',v.v));"
+      "case'M':return new Map(v.v.map(function(e){return[__dec(e[0],seen),__dec(e[1],seen)]}));"
+      "case'S':return new Set(v.v.map(function(e){return __dec(e,seen)}));"
+      "case'R':return new RegExp(v.s,v.f);"
+      "case'N':return NaN;"
+      "case'I':return v.s>0?1/0:-1/0;"
+      "case'U':return void 0;"
+    "}"
+    "if(!seen)seen=[];"
+    "if(seen.indexOf(v)!==-1)return v;"
+    "seen.push(v);"
+    "if(Array.isArray(v)){for(var i=0;i<v.length;i++)v[i]=__dec(v[i],seen);return v;}"
+    "var k=Object.keys(v),i;"
+    "for(i=0;i<k.length;i++)v[k[i]]=__dec(v[k[i]],seen);"
+    "return v;"
+    "})";
+
+/* Browser-side JS injected into the webview via webview_init().
+   _promises is a closure variable inside the __webview__ IIFE, so we
+   can't replace onReply.  Instead we:
+   1. Override .post() to encode outgoing args in the JSON payload
+   2. Override .call() to wrap the returned promise and decode the result */
+static const char rp_wv_browser_js[] =
+    "(function(){"
+    "function __enc(v,seen,path){"
+      "if(v===void 0)return{__t:'U'};"
+      "if(v===null)return null;"
+      "if(typeof v==='boolean'||typeof v==='string')return v;"
+      "if(typeof v==='number'){"
+        "if(v!==v)return{__t:'N'};"
+        "if(v===1/0)return{__t:'I',s:1};"
+        "if(v===-1/0)return{__t:'I',s:-1};"
+        "return v;"
+      "}"
+      "if(typeof v!=='object')return v;"
+      "if(!seen){seen=new Map();path='$'}"
+      "if(seen.has(v))return{_cyclic_ref:seen.get(v)};"
+      "seen.set(v,path);"
+      "if(v instanceof Date)return{__t:'D',v:v.getTime()};"
+      "if(v instanceof RegExp)return{__t:'R',s:v.source,f:v.flags};"
+      "if(v instanceof Map){"
+        "var a=[],it=v.entries(),e;while(!(e=it.next()).done)"
+        "a.push([__enc(e.value[0],seen,path),__enc(e.value[1],seen,path)]);"
+        "return{__t:'M',v:a};"
+      "}"
+      "if(v instanceof Set){"
+        "var a=[],it=v.values(),e;while(!(e=it.next()).done)"
+        "a.push(__enc(e.value,seen,path));"
+        "return{__t:'S',v:a};"
+      "}"
+      "if(v instanceof ArrayBuffer){"
+        "var a=new Uint8Array(v),s='',i;"
+        "for(i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);"
+        "return{__t:'B',v:btoa(s)};"
+      "}"
+      "if(ArrayBuffer.isView(v)){"
+        "var u8=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);"
+        "var s='',i;for(i=0;i<u8.length;i++)s+=String.fromCharCode(u8[i]);"
+        "return{__t:'B',v:btoa(s)};"
+      "}"
+      "if(Array.isArray(v))return v.map(function(x,i){return __enc(x,seen,path+'['+i+']')});"
+      "var r={},k=Object.keys(v),i;"
+      "for(i=0;i<k.length;i++)r[k[i]]=__enc(v[k[i]],seen,path+'.'+k[i]);"
+      "return r;"
+    "}"
+    "function __dec(v){"
+      "if(v===null||typeof v!=='object')return v;"
+      "if(v.__t)switch(v.__t){"
+        "case'D':return new Date(v.v);"
+        "case'B':{"
+          "var b=atob(v.v),u=new Uint8Array(b.length),i;"
+          "for(i=0;i<b.length;i++)u[i]=b.charCodeAt(i);"
+          "return u.buffer;"
+        "}"
+        "case'R':return new RegExp(v.s,v.f);"
+        "case'M':{var m=new Map(),i;for(i=0;i<v.v.length;i++)m.set(__dec(v.v[i][0]),__dec(v.v[i][1]));return m;}"
+        "case'S':{var s=new Set(),i;for(i=0;i<v.v.length;i++)s.add(__dec(v.v[i]));return s;}"
+        "case'N':return NaN;"
+        "case'I':return v.s>0?Infinity:-Infinity;"
+        "case'U':return void 0;"
+      "}"
+      "if(Array.isArray(v))return v.map(__dec);"
+      "var r={},k=Object.keys(v),i;"
+      "for(i=0;i<k.length;i++)r[k[i]]=__dec(v[k[i]]);"
+      "return r;"
+    "}"
+    /* Override JSON.stringify to pre-encode via __enc.  This handles
+       Dates, Buffers, RegExps, NaN, Infinity, undefined, AND cyclic
+       references — all in one pass before stringify sees them.
+       For webview protocol messages, only encode the params so that
+       _cyclic_ref paths are relative to each argument (matching what
+       the Rampart side receives after the protocol extracts params). */
+    "var _origStringify=JSON.stringify;"
+    "JSON.stringify=function(v,rep,sp){"
+      "if(v&&typeof v==='object'&&v.id&&v.method&&v.params){"
+        "var ep=v.params.map(function(p){return __enc(p,null)});"
+        "return _origStringify.call(JSON,{id:v.id,method:v.method,params:ep},rep,sp);"
+      "}"
+      "return _origStringify.call(JSON,__enc(v,null),rep,sp);"
+    "};"
+    /* Resolve _cyclic_ref path strings to actual object references. */
+    "function __resolveRef(root,path){"
+      "var p=path.replace(/\\[(\\d+)\\]/g,'.$1').split('.').slice(1);"
+      "var o=root,i;"
+      "for(i=0;i<p.length;i++){"
+        "if(o===null||typeof o!=='object')return undefined;"
+        "o=o[p[i]];"
+      "}"
+      "return o;"
+    "}"
+    "function __resolveCyclic(v,root,seen){"
+      "if(v===null||typeof v!=='object')return v;"
+      "if(!root)root=v;"
+      "if(!seen)seen=new Set();"
+      "if(seen.has(v))return v;"
+      "seen.add(v);"
+      "if(typeof v._cyclic_ref==='string')return __resolveRef(root,v._cyclic_ref);"
+      "if(Array.isArray(v)){for(var i=0;i<v.length;i++)v[i]=__resolveCyclic(v[i],root,seen);}"
+      "else{var k=Object.keys(v),i;for(i=0;i<k.length;i++)v[k[i]]=__resolveCyclic(v[k[i]],root,seen);}"
+      "return v;"
+    "}"
+    /* Incoming: override JSON.parse to decode tags and restore cyclic
+       refs in return values. onReply() calls JSON.parse internally. */
+    "var _origParse=JSON.parse;"
+    "JSON.parse=function(s,r){"
+      "var v=_origParse.call(JSON,s,r);"
+      "v=__dec(v);"
+      "v=__resolveCyclic(v);"
+      "return v;"
+    "};"
+    "})();";
+
+/* ============================================================
    Thread safety: webview requires the main thread
    ============================================================ */
 
@@ -99,10 +291,48 @@ static void wv_bind_callback(const char *id, const char *req, void *arg)
     duk_remove(ctx, top);      /* remove this */
     /* stack: [func] */
 
-    /* Parse req JSON array and push individual args */
+    /* Parse req JSON array.  Process in two phases:
+       1. Restore _cyclic_ref markers to actual object references
+          (per-arg, since paths are relative to each argument's root)
+       2. Decode type tags {__t:...} → real Duktape types
+       This order matters: the cyclic restoration must happen while
+       the tags are still plain objects (before type decoding turns
+       them into Dates, Buffers, etc. that str_rp_to_json_safe would
+       re-serialize differently). */
     duk_push_string(ctx, req);
     duk_json_decode(ctx, -1);
-    /* stack: [func, argsArray] */
+
+    /* Phase 1: restore cyclic references per argument */
+    {
+        duk_uarridx_t alen = (duk_uarridx_t)duk_get_length(ctx, -1);
+        duk_uarridx_t ai;
+        for (ai = 0; ai < alen; ai++) {
+            duk_get_prop_index(ctx, -1, ai);
+            if (duk_is_object(ctx, -1) && !duk_is_function(ctx, -1)) {
+                char *safe = str_rp_to_json_safe(ctx, -1, NULL, 0);
+                if (safe) {
+                    duk_pop(ctx);
+                    duk_get_global_string(ctx, "JSON");
+                    duk_get_prop_string(ctx, -1, "parse");
+                    duk_push_string(ctx, safe);
+                    free(safe);
+                    duk_push_true(ctx);
+                    duk_call(ctx, 2);
+                    duk_remove(ctx, -2); /* remove JSON */
+                }
+            }
+            duk_put_prop_index(ctx, -2, ai);
+        }
+    }
+
+    /* Phase 2: decode type tags {__t:...} → real Duktape types */
+    duk_push_global_stash(ctx);
+    duk_get_prop_string(ctx, -1, "rp_wv_decode");
+    duk_dup(ctx, -3); /* copy args array */
+    duk_call(ctx, 1);
+    duk_remove(ctx, -2); /* remove stash */
+    duk_remove(ctx, -2); /* remove original array */
+    /* stack: [func, decodedArgsArray] */
 
     duk_uarridx_t nargs = (duk_uarridx_t)duk_get_length(ctx, -1);
     duk_uarridx_t i;
@@ -119,7 +349,6 @@ static void wv_bind_callback(const char *id, const char *req, void *arg)
     if (duk_pcall(ctx, (duk_idx_t)nargs) != 0) {
         /* Error: get message, JSON-encode it, return as error */
         const char *errmsg = duk_safe_to_string(ctx, -1);
-        /* Build a JSON string for the error */
         duk_push_string(ctx, errmsg);
         duk_json_encode(ctx, -1);
         const char *json_err = duk_get_string(ctx, -1);
@@ -128,12 +357,21 @@ static void wv_bind_callback(const char *id, const char *req, void *arg)
         return;
     }
 
-    /* Success: JSON-encode the return value */
+    /* Success: encode type tags and serialize with cyclic-ref safety */
     if (duk_is_undefined(ctx, -1)) {
         webview_return(bi->w, id, 0, "");
     } else {
-        duk_json_encode(ctx, -1);
-        webview_return(bi->w, id, 0, duk_get_string(ctx, -1));
+        /* Encode special types as {__t:...} tags */
+        duk_push_global_stash(ctx);
+        duk_get_prop_string(ctx, -1, "rp_wv_encode");
+        duk_dup(ctx, -3); /* copy return value */
+        duk_call(ctx, 1);
+        /* Serialize with cyclic-ref safety */
+        char *json = str_rp_to_json_safe(ctx, -1, NULL, 0);
+        duk_pop(ctx); /* encoded value */
+        duk_pop(ctx); /* stash */
+        webview_return(bi->w, id, 0, json);
+        free(json);
     }
 
     duk_set_top(ctx, top);
@@ -233,6 +471,9 @@ static duk_ret_t wv_constructor(duk_context *ctx)
 
     webview_set_title(w, title);
     webview_set_size(w, width, height, WEBVIEW_HINT_NONE);
+
+    /* Inject the tagged-JSON protocol override before any page loads */
+    webview_init(w, rp_wv_browser_js);
 
     if (url)
         webview_navigate(w, url);
@@ -652,7 +893,7 @@ static void jsc_to_duk(duk_context *ctx, JSCContext *jsc_ctx,
         return;
     }
 
-    /* --- Map → Array of [key, value] pairs --- */
+    /* --- Map → Duktape Map --- */
 
     if (jsc_value_object_is_instance_of(value, "Map")) {
         jsc_context_set_value(jsc_ctx, "__rp_cvt", value);
@@ -660,13 +901,20 @@ static void jsc_to_duk(duk_context *ctx, JSCContext *jsc_ctx,
             "Array.from(__rp_cvt.entries())", -1);
         JSCValue *tmp = jsc_context_evaluate(jsc_ctx,
             "delete globalThis.__rp_cvt", -1);
+
+        /* Convert entries array to Duktape [[k,v],...] */
         jsc_to_duk(ctx, jsc_ctx, arr, depth + 1);
+        /* Construct: new Map(entries) */
+        duk_get_global_string(ctx, "Map");
+        duk_pull(ctx, -2); /* move entries array before Map */
+        duk_new(ctx, 1);
+
         g_object_unref(arr);
         g_object_unref(tmp);
         return;
     }
 
-    /* --- Set → Array --- */
+    /* --- Set → Duktape Set --- */
 
     if (jsc_value_object_is_instance_of(value, "Set")) {
         jsc_context_set_value(jsc_ctx, "__rp_cvt", value);
@@ -674,7 +922,14 @@ static void jsc_to_duk(duk_context *ctx, JSCContext *jsc_ctx,
             "Array.from(__rp_cvt)", -1);
         JSCValue *tmp = jsc_context_evaluate(jsc_ctx,
             "delete globalThis.__rp_cvt", -1);
+
+        /* Convert values array to Duktape [...] */
         jsc_to_duk(ctx, jsc_ctx, arr, depth + 1);
+        /* Construct: new Set(values) */
+        duk_get_global_string(ctx, "Set");
+        duk_pull(ctx, -2);
+        duk_new(ctx, 1);
+
         g_object_unref(arr);
         g_object_unref(tmp);
         return;
@@ -1985,6 +2240,14 @@ static duk_ret_t jsctx_destroy(duk_context *ctx)
 
 duk_ret_t duk_open_module(duk_context *ctx)
 {
+    /* Register Duktape-side tagged-JSON encoder/decoder in global stash */
+    duk_push_global_stash(ctx);
+    duk_eval_string(ctx, rp_wv_encode_js);
+    duk_put_prop_string(ctx, -2, "rp_wv_encode");
+    duk_eval_string(ctx, rp_wv_decode_js);
+    duk_put_prop_string(ctx, -2, "rp_wv_decode");
+    duk_pop(ctx); /* stash */
+
     duk_push_object(ctx);  /* module object */
     duk_idx_t mod_idx = duk_get_top_index(ctx);
 
