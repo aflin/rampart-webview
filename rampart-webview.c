@@ -16,12 +16,16 @@
 #include "rampart.h"
 #include "webview/api.h"
 
-/* JSC headless features are only available on platforms with WebKitGTK
-   (Linux, and potentially macOS).  Windows uses WebView2 which does
-   not expose a standalone JavaScriptCore API. */
+/* JSC headless features are available on Linux (via WebKitGTK) and
+   macOS (via the system JavaScriptCore.framework).  Windows uses
+   WebView2 which does not expose a standalone JavaScriptCore API. */
 #if !defined(_WIN32) && !defined(__CYGWIN__)
 #define HAVE_JSC 1
+#ifdef __APPLE__
+#include "jsc_apple_compat.h"
+#else
 #include <jsc/jsc.h>
+#endif
 #endif
 
 /* ============================================================

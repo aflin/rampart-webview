@@ -76,6 +76,8 @@ if(APPLE)
     set_target_properties(rampart-webview PROPERTIES
         LINK_FLAGS "-undefined dynamic_lookup"
     )
+    # macOS: link JavaScriptCore.framework for headless JSC support
+    target_link_libraries(rampart-webview PRIVATE "-framework JavaScriptCore")
 elseif(MSYS_COMPILER)
     # Link against rampart import library to resolve duktape symbols
     target_link_libraries(rampart-webview PRIVATE "${RAMPART_BIN}/librampart.dll.a")
