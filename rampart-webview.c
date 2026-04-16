@@ -156,11 +156,16 @@ static const char rp_wv_enhance_js[] =
             "'levels.forEach(function(lv){'+"
               "'var orig=console[lv];'+"
               "'console[lv]=function(){'+"
-                "'var args=Array.prototype.slice.call(arguments).map(function(a){'+"
-                  "'try{return typeof a===\\'object\\'?JSON.stringify(a):String(a)}'+"
-                  "'catch(e){return String(a)}'+"
-                "'});'+"
-                "'try{window.__rp_console(lv,args)}catch(e){}'+"
+                "'var fn=window.__rp_console;'+"
+                "'if(typeof fn===\\'function\\'){'+"
+                  "'try{'+"
+                    "'var args=Array.prototype.slice.call(arguments).map(function(a){'+"
+                      "'try{return typeof a===\\'object\\'?JSON.stringify(a):String(a)}'+"
+                      "'catch(e){return String(a)}'+"
+                    "'});'+"
+                    "'fn(lv,args);'+"
+                  "'}catch(e){}'+"
+                "'}'+"
                 "'return orig.apply(console,arguments);'+"
               "'};'+"
             "'});'+"
@@ -1004,6 +1009,14 @@ static duk_ret_t wv_set_cookie(duk_context *ctx)
     return 0;
 }
 
+static void cookie_get_all_cb(GObject *src, GAsyncResult *res, gpointer data)
+{
+    cookie_op_t *op = (cookie_op_t *)data;
+    op->cookies = webkit_cookie_manager_get_all_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(src), res, &op->error);
+    op->done = 1;
+}
+
 static duk_ret_t wv_get_cookies(duk_context *ctx)
 {
     REQUIRE_MAIN_THREAD(ctx);
@@ -1014,14 +1027,14 @@ static duk_ret_t wv_get_cookies(duk_context *ctx)
     if (!handle) RP_THROW(ctx, "webview.getCookies(): no browser handle");
     WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
 
-    const char *uri = NULL;
-    WebKitCookieManager *mgr = get_cookie_manager(wk, &uri);
+    WebKitCookieManager *mgr = get_cookie_manager(wk, NULL);
     if (!mgr) RP_THROW(ctx, "webview.getCookies(): no cookie manager");
-    if (!uri || !*uri)
-        RP_THROW(ctx, "webview.getCookies(): no current page");
 
+    /* Return all cookies in the store (not filtered by URI).  This
+       matches the macOS implementation and avoids surprises when
+       setHtml changes the URL to an origin with no host. */
     cookie_op_t op = { 0, NULL, NULL };
-    webkit_cookie_manager_get_cookies(mgr, uri, NULL, cookie_get_cb, &op);
+    webkit_cookie_manager_get_all_cookies(mgr, NULL, cookie_get_all_cb, &op);
     while (!op.done)
         g_main_context_iteration(NULL, TRUE);
 

@@ -138,19 +138,13 @@ char *rp_wkwebview_get_cookies(void *wkwebview)
                                  beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     }
 
-    /* Filter by current URL's host (domain match) and build a dict */
+    /* Build a dict of name→value.  We return all cookies in the store
+       for simplicity; the Linux implementation filters by URI but that
+       doesn't round-trip with setHtml pages, so behavior is aligned
+       by returning everything. */
+    (void)host;
     NSMutableDictionary *dict = [NSMutableDictionary dictionary];
     for (NSHTTPCookie *c in cookies) {
-        if (host && host.length > 0) {
-            NSString *d = c.domain;
-            if (!d) continue;
-            if (d.length > 0 && [d characterAtIndex:0] == '.')
-                d = [d substringFromIndex:1];
-            if (![host isEqualToString:d] &&
-                ![host hasSuffix:[NSString stringWithFormat:@".%@", d]]) {
-                continue;
-            }
-        }
         if (c.name && c.value) dict[c.name] = c.value;
     }
 
