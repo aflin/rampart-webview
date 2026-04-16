@@ -25,6 +25,9 @@ set(WEBVIEW_INCLUDE_DIR "${WEBVIEW_SOURCE_DIR}/core/include")
 # The module shared library
 if(APPLE)
     add_library(rampart-webview SHARED rampart-webview.c snapshot_macos.m)
+    # ARC is required: async callbacks (snapshot, cookies) set __block ObjC
+    # object pointers that must be retained across run-loop pumping.
+    set_source_files_properties(snapshot_macos.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 else()
     add_library(rampart-webview SHARED rampart-webview.c)
 endif()
