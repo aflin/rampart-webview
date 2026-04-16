@@ -946,13 +946,6 @@ static void cookie_added_cb(GObject *src, GAsyncResult *res, gpointer data)
     op->done = 1;
 }
 
-static void cookie_get_cb(GObject *src, GAsyncResult *res, gpointer data)
-{
-    cookie_op_t *op = (cookie_op_t *)data;
-    op->cookies = webkit_cookie_manager_get_cookies_finish(
-        WEBKIT_COOKIE_MANAGER(src), res, &op->error);
-    op->done = 1;
-}
 
 /* Helper: get the cookie manager and current URI host */
 static WebKitCookieManager *get_cookie_manager(WebKitWebView *wk,
