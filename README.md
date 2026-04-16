@@ -123,13 +123,76 @@ Useful for setting up global functions or polyfills.
 w.init("window.myGlobal = 'available on every page';");
 ```
 
-#### w.eval(js)
+#### w.eval(js [, callback])
 
-Evaluate JavaScript in the webview immediately.
+Evaluate JavaScript in the webview immediately.  `js` is always a string — it
+is executed inside the browser's JS engine, not Duktape.
+
+Fire-and-forget form (no return value):
 
 ```javascript
 w.eval("document.title = 'Changed from Rampart';");
 ```
+
+Callback form — captures the value of the last expression and passes it to
+the callback as `(result, error)`.  Rich types are preserved through the
+tagged-JSON protocol (Dates, Buffers, RegExps, Maps, Sets, cyclic references,
+etc.), the same as bound functions:
+
+```javascript
+w.eval("document.title", function(title, err) {
+    if (err) console.log("eval error:", err.message);
+    else     console.log("title:", title);
+});
+
+// Promises are awaited automatically
+w.eval("fetch('/api/data').then(r => r.json())", function(data, err) {
+    // ...
+});
+```
+
+The eval should be triggered after the page has loaded (see `w.on("load",...)`
+below).  Evaluating before a page is loaded will do nothing.
+
+#### w.getContents(callback)
+
+Fetch the current DOM as an HTML string, delivered to the callback.
+Shorthand for `w.eval("document.documentElement.outerHTML", callback)`.
+
+```javascript
+w.on("load", function() {
+    w.getContents(function(html, err) {
+        rampart.utils.fprintf("page.html", "%s", html);
+    });
+});
+```
+
+#### w.on(event, handler)
+
+Subscribe to a webview event.  Must be called before `w.run()` (and before
+the first `setHtml()`/`navigate()` to receive events from the initial page
+load).
+
+**`"load"`** — fires when a page finishes loading.  Handler receives the URL:
+
+```javascript
+w.on("load", function(url) {
+    console.log("page loaded:", url);
+});
+```
+
+**`"console"`** — fires for every `console.log/warn/error/info/debug` call
+inside the webview.  Handler receives the level and an array of stringified
+arguments:
+
+```javascript
+w.on("console", function(level, args) {
+    console.log("[page " + level + "]", args.join(" "));
+});
+```
+
+Multiple handlers can be registered for the same event — they are all called
+in registration order.
 
 #### w.bind(name, callback)
 
@@ -233,6 +296,45 @@ w.run();
 Combined with the `headless.sh` helper script (see
 [Running Without a Display](#running-without-a-display) below), this enables
 automated screenshot generation and visual testing without a GUI session.
+
+#### w.setCookie(name, value)
+
+Set a cookie in the webview's cookie store for the current page's host.
+Available on Linux (WebKitGTK cookie manager) and macOS (WKHTTPCookieStore).
+Not available on Windows.  The page must be loaded over a real URL scheme
+(`http://`, `https://`, etc.) — `about:blank` and `data:` URIs cannot hold
+cookies.
+
+```javascript
+w.on("load", function() {
+    w.setCookie("session", "abc123");
+    w.setCookie("user", "alice");
+});
+w.navigate("https://example.com/");
+```
+
+#### w.getCookies()
+
+Return all cookies for the current URL's host as a plain object of
+`{name: value, ...}`.  Available on Linux and macOS.
+
+```javascript
+w.on("load", function() {
+    var cookies = w.getCookies();
+    console.log(cookies.session);   // "abc123"
+});
+```
+
+#### w.setUserAgent(string)
+
+Set the User-Agent string sent with HTTP requests and returned by
+`navigator.userAgent`.  Available on Linux and macOS.  Call before
+`navigate()` to affect the first request.
+
+```javascript
+w.setUserAgent("MyApp/1.0");
+w.navigate("https://example.com/");
+```
 
 ### Running Without a Display
 

@@ -105,6 +105,86 @@ static const char rp_wv_decode_js[] =
     "return v;"
     "})";
 
+/* JS enhancement script — run after the WebView prototype is built in C.
+   Adds callback-based eval, getContents, and event subscription on top
+   of the existing bind/init/eval primitives.  The argument is the
+   WebView.prototype object. */
+static const char rp_wv_enhance_js[] =
+    "(function(proto){"
+    "var _evalCounter=0;"
+    /* Save original eval (fire-and-forget) */
+    "var _origEval=proto.eval;"
+    /* Enhanced eval: if a callback is provided, capture the return value */
+    "proto.eval=function(code,callback){"
+      "if(!callback){"
+        "return _origEval.call(this,code);"
+      "}"
+      "var self=this;"
+      "var id='__rp_eval_'+(++_evalCounter);"
+      "this.bind(id,function(ok,value){"
+        "self.unbind(id);"
+        "if(ok)callback(value,null);"
+        "else callback(null,new Error(value));"
+      "});"
+      /* code is now always a string at this point */
+      "var body='eval('+JSON.stringify(code)+')';"
+      "var wrapper='(async function(){try{'+"
+        "'var r='+body+';'+"
+        "'if(r&&typeof r.then===\\'function\\')r=await r;'+"
+        "'window[\\''+id+'\\'](true,r);'+"
+        "'}catch(e){window[\\''+id+'\\'](false,String(e));}})()';"
+      "_origEval.call(this,wrapper);"
+    "};"
+    /* getContents: fetch current DOM as HTML */
+    "proto.getContents=function(callback){"
+      "this.eval('document.documentElement.outerHTML',callback);"
+    "};"
+    /* on(event, handler): subscribe to 'console' or 'load' events */
+    "proto.on=function(event,handler){"
+      "if(typeof handler!=='function')"
+        "throw new Error('webview.on(): handler must be a function');"
+      "if(!this.__handlers)this.__handlers={};"
+      "if(!this.__handlers[event])this.__handlers[event]=[];"
+      "var handlers=this.__handlers[event];"
+      "if(event==='console'){"
+        "if(handlers.length===0){"
+          "this.bind('__rp_console',function(level,args){"
+            "handlers.forEach(function(h){h(level,args)});"
+          "});"
+          "this.init('(function(){'+"
+            "'var levels=[\\'log\\',\\'warn\\',\\'error\\',\\'info\\',\\'debug\\'];'+"
+            "'levels.forEach(function(lv){'+"
+              "'var orig=console[lv];'+"
+              "'console[lv]=function(){'+"
+                "'var args=Array.prototype.slice.call(arguments).map(function(a){'+"
+                  "'try{return typeof a===\\'object\\'?JSON.stringify(a):String(a)}'+"
+                  "'catch(e){return String(a)}'+"
+                "'});'+"
+                "'try{window.__rp_console(lv,args)}catch(e){}'+"
+                "'return orig.apply(console,arguments);'+"
+              "'};'+"
+            "'});'+"
+          "'})();');"
+        "}"
+        "handlers.push(handler);"
+        "return;"
+      "}"
+      "if(event==='load'){"
+        "if(handlers.length===0){"
+          "this.bind('__rp_load',function(url){"
+            "handlers.forEach(function(h){h(url)});"
+          "});"
+          "this.init('window.addEventListener(\\'load\\',function(){'+"
+            "'try{window.__rp_load(window.location.href)}catch(e){}'+"
+          "'});');"
+        "}"
+        "handlers.push(handler);"
+        "return;"
+      "}"
+      "throw new Error(\"webview.on(): unknown event '\"+event+\"' (expected 'console' or 'load')\");"
+    "};"
+    "})";
+
 /* Browser-side JS injected into the webview via webview_init().
    _promises is a closure variable inside the __webview__ IIFE, so we
    can't replace onReply.  Instead we:
@@ -841,12 +921,165 @@ static duk_ret_t wv_snapshot(duk_context *ctx)
 
 #define HAVE_SNAPSHOT 1
 
+/* ============================================================
+   Cookies and User Agent (Linux/WebKitGTK)
+   ============================================================ */
+
+#include <libsoup/soup.h>
+
+typedef struct {
+    int    done;
+    GList *cookies;
+    GError *error;
+} cookie_op_t;
+
+static void cookie_added_cb(GObject *src, GAsyncResult *res, gpointer data)
+{
+    cookie_op_t *op = (cookie_op_t *)data;
+    webkit_cookie_manager_add_cookie_finish(
+        WEBKIT_COOKIE_MANAGER(src), res, &op->error);
+    op->done = 1;
+}
+
+static void cookie_get_cb(GObject *src, GAsyncResult *res, gpointer data)
+{
+    cookie_op_t *op = (cookie_op_t *)data;
+    op->cookies = webkit_cookie_manager_get_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(src), res, &op->error);
+    op->done = 1;
+}
+
+/* Helper: get the cookie manager and current URI host */
+static WebKitCookieManager *get_cookie_manager(WebKitWebView *wk,
+                                                const char **uri_out)
+{
+    WebKitWebContext *wctx = webkit_web_view_get_context(wk);
+    if (!wctx) return NULL;
+    if (uri_out) *uri_out = webkit_web_view_get_uri(wk);
+    return webkit_web_context_get_cookie_manager(wctx);
+}
+
+static duk_ret_t wv_set_cookie(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    const char *name  = REQUIRE_STRING(ctx, 0,
+        "webview.setCookie(): first argument must be a string (name)");
+    const char *value = REQUIRE_STRING(ctx, 1,
+        "webview.setCookie(): second argument must be a string (value)");
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.setCookie(): no browser handle");
+    WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
+
+    const char *uri = NULL;
+    WebKitCookieManager *mgr = get_cookie_manager(wk, &uri);
+    if (!mgr) RP_THROW(ctx, "webview.setCookie(): no cookie manager");
+    if (!uri || !*uri)
+        RP_THROW(ctx, "webview.setCookie(): no current page (call setHtml or navigate first)");
+
+    /* Extract host from current URI */
+    GUri *guri = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
+    if (!guri) RP_THROW(ctx, "webview.setCookie(): failed to parse current URI");
+    const char *host = g_uri_get_host(guri);
+    if (!host || !*host) host = "localhost";
+
+    SoupCookie *cookie = soup_cookie_new(name, value, host, "/", -1);
+
+    cookie_op_t op = { 0, NULL, NULL };
+    webkit_cookie_manager_add_cookie(mgr, cookie, NULL, cookie_added_cb, &op);
+    while (!op.done)
+        g_main_context_iteration(NULL, TRUE);
+
+    soup_cookie_free(cookie);
+    g_uri_unref(guri);
+
+    if (op.error) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "webview.setCookie(): %s", op.error->message);
+        g_error_free(op.error);
+        RP_THROW(ctx, "%s", msg);
+    }
+    return 0;
+}
+
+static duk_ret_t wv_get_cookies(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.getCookies(): no browser handle");
+    WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
+
+    const char *uri = NULL;
+    WebKitCookieManager *mgr = get_cookie_manager(wk, &uri);
+    if (!mgr) RP_THROW(ctx, "webview.getCookies(): no cookie manager");
+    if (!uri || !*uri)
+        RP_THROW(ctx, "webview.getCookies(): no current page");
+
+    cookie_op_t op = { 0, NULL, NULL };
+    webkit_cookie_manager_get_cookies(mgr, uri, NULL, cookie_get_cb, &op);
+    while (!op.done)
+        g_main_context_iteration(NULL, TRUE);
+
+    if (op.error) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "webview.getCookies(): %s", op.error->message);
+        g_error_free(op.error);
+        if (op.cookies) g_list_free_full(op.cookies,
+            (GDestroyNotify)soup_cookie_free);
+        RP_THROW(ctx, "%s", msg);
+    }
+
+    duk_push_object(ctx);
+    for (GList *it = op.cookies; it; it = it->next) {
+        SoupCookie *c = (SoupCookie *)it->data;
+        const char *cn = soup_cookie_get_name(c);
+        const char *cv = soup_cookie_get_value(c);
+        if (cn && cv) {
+            duk_push_string(ctx, cv);
+            duk_put_prop_string(ctx, -2, cn);
+        }
+    }
+    if (op.cookies)
+        g_list_free_full(op.cookies, (GDestroyNotify)soup_cookie_free);
+
+    return 1;
+}
+
+static duk_ret_t wv_set_user_agent(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    const char *ua = REQUIRE_STRING(ctx, 0,
+        "webview.setUserAgent(): argument must be a string");
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.setUserAgent(): no browser handle");
+    WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
+
+    WebKitSettings *settings = webkit_web_view_get_settings(wk);
+    webkit_settings_set_user_agent(settings, ua);
+    return 0;
+}
+
+#define HAVE_COOKIES 1
+#define HAVE_USER_AGENT 1
+
 #elif defined(__APPLE__)
 
-/* macOS: use WKWebView's snapshot API via Objective-C helper */
+/* macOS: bridges to Objective-C helpers in snapshot_macos.m */
 extern unsigned char *rp_wkwebview_snapshot(void *wkwebview,
                                             int full_document,
                                             size_t *out_len);
+extern void rp_wkwebview_set_user_agent(void *wkwebview, const char *ua);
+extern int  rp_wkwebview_set_cookie(void *wkwebview, const char *name,
+                                     const char *value);
+extern char *rp_wkwebview_get_cookies(void *wkwebview);
 
 static duk_ret_t wv_snapshot(duk_context *ctx)
 {
@@ -876,7 +1109,61 @@ static duk_ret_t wv_snapshot(duk_context *ctx)
     return 1;
 }
 
+static duk_ret_t wv_set_user_agent(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    const char *ua = REQUIRE_STRING(ctx, 0,
+        "webview.setUserAgent(): argument must be a string");
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.setUserAgent(): no browser handle");
+    rp_wkwebview_set_user_agent(handle, ua);
+    return 0;
+}
+
+static duk_ret_t wv_set_cookie(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    const char *name  = REQUIRE_STRING(ctx, 0,
+        "webview.setCookie(): first argument must be a string (name)");
+    const char *value = REQUIRE_STRING(ctx, 1,
+        "webview.setCookie(): second argument must be a string (value)");
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.setCookie(): no browser handle");
+
+    if (!rp_wkwebview_set_cookie(handle, name, value))
+        RP_THROW(ctx, "webview.setCookie(): failed to set cookie");
+    return 0;
+}
+
+static duk_ret_t wv_get_cookies(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.getCookies(): no browser handle");
+
+    char *json = rp_wkwebview_get_cookies(handle);
+    if (!json) {
+        duk_push_object(ctx);
+        return 1;
+    }
+    duk_push_string(ctx, json);
+    free(json);
+    duk_json_decode(ctx, -1);
+    return 1;
+}
+
 #define HAVE_SNAPSHOT 1
+#define HAVE_COOKIES 1
+#define HAVE_USER_AGENT 1
 
 #endif /* snapshot platform */
 
@@ -2459,8 +2746,27 @@ duk_ret_t duk_open_module(duk_context *ctx)
     duk_put_prop_string(ctx, -2, "snapshot");
 #endif
 
-    /* Set prototype on constructor */
+#ifdef HAVE_COOKIES
+    duk_push_c_function(ctx, wv_set_cookie, 2);
+    duk_put_prop_string(ctx, -2, "setCookie");
+    duk_push_c_function(ctx, wv_get_cookies, 0);
+    duk_put_prop_string(ctx, -2, "getCookies");
+#endif
+
+#ifdef HAVE_USER_AGENT
+    duk_push_c_function(ctx, wv_set_user_agent, 1);
+    duk_put_prop_string(ctx, -2, "setUserAgent");
+#endif
+
+    /* Set prototype on constructor (keep a copy on the stack for enhancement) */
+    duk_dup(ctx, -1);
     duk_put_prop_string(ctx, con_idx, "prototype");
+
+    /* Run the JS enhancement script, passing the prototype as its argument */
+    duk_eval_string(ctx, rp_wv_enhance_js);
+    duk_pull(ctx, -2); /* move prototype to top */
+    duk_call(ctx, 1);
+    duk_pop(ctx); /* discard return value */
 
     /* Put constructor as "WebView" on module object */
     duk_put_prop_string(ctx, mod_idx, "WebView");
