@@ -267,7 +267,7 @@ w.destroy();
 #### w.snapshot([region])
 
 Capture the webview's rendered content as a PNG image and return it as a
-:green:`Buffer`.  Available on Linux (via WebKitGTK) and macOS (via WKWebView).
+`Buffer`.  Available on Linux (via WebKitGTK) and macOS (via WKWebView).
 Not available on Windows.
 
 ```javascript
