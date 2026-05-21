@@ -3,7 +3,7 @@
 A Rampart module that provides a cross-platform webview (native browser window)
 for building desktop GUI applications with HTML, CSS, and JavaScript.
 
-Uses the [webview](https://github.com/nicedoc/webview) library, which provides:
+Uses the [webview](https://github.com/webview/webview) library, which provides:
 - **Linux**: GTK + WebKitGTK
 - **macOS**: Cocoa + WebKit
 - **Windows**: Win32 + WebView2
