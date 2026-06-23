@@ -122,7 +122,11 @@ execute_process(
     RESULT_VARIABLE RAMPART_MODULES_RESULT
 )
 if(NOT RAMPART_MODULES_RESULT EQUAL 0)
-    set(RAMPART_MODULES_PATH "/usr/local/rampart/modules")
+    # Fallback (e.g. the oven, where `rampart` isn't on PATH to query): derive the
+    # modules dir from RAMPART_INCLUDE's parent instead of hardcoding, so it
+    # follows a custom prefix (e.g. /usr/local/rampart-ml).
+    get_filename_component(_rp_root "${RAMPART_INCLUDE}" DIRECTORY)
+    set(RAMPART_MODULES_PATH "${_rp_root}/modules")
 endif()
 
 install(TARGETS rampart-webview
