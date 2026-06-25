@@ -963,10 +963,17 @@ static int have_get_all_cookies(void)
     static int probed = 0;
     if (!probed) {
         probed = 1;
-        p_get_all_cookies = (webkit_get_all_cookies_fn)
-            dlsym(RTLD_DEFAULT, "webkit_cookie_manager_get_all_cookies");
-        p_get_all_cookies_finish = (webkit_get_all_cookies_finish_fn)
-            dlsym(RTLD_DEFAULT, "webkit_cookie_manager_get_all_cookies_finish");
+        /* dlopen(NULL) returns a handle to the global symbol table
+           (process + loaded libs).  Portable POSIX; avoids the
+           GNU-only RTLD_DEFAULT, which -std=c99 hides. */
+        void *self = dlopen(NULL, RTLD_LAZY);
+        if (self) {
+            p_get_all_cookies = (webkit_get_all_cookies_fn)
+                dlsym(self, "webkit_cookie_manager_get_all_cookies");
+            p_get_all_cookies_finish = (webkit_get_all_cookies_finish_fn)
+                dlsym(self, "webkit_cookie_manager_get_all_cookies_finish");
+            dlclose(self);
+        }
     }
     return p_get_all_cookies && p_get_all_cookies_finish;
 }
