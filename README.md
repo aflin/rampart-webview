@@ -313,15 +313,46 @@ w.on("load", function() {
 w.navigate("https://example.com/");
 ```
 
-#### w.getCookies()
+#### w.getCookies([uri])
 
-Return all cookies for the current URL's host as a plain object of
-`{name: value, ...}`.  Available on Linux and macOS.
+Return the cookies that would be sent for `uri` (or the current page's
+URI when `uri` is omitted) as a plain object of `{name: value, ...}`.
+Host suffix, path prefix, and secure-flag filtering are applied so the
+result matches what the browser would actually attach to a request.
+
+Available on Linux and macOS.  Throws if no URI is passed and no page
+has been loaded yet.
 
 ```javascript
 w.on("load", function() {
     var cookies = w.getCookies();
     console.log(cookies.session);   // "abc123"
+
+    /* Cookies for a different origin: */
+    var other = w.getCookies("https://other.example.com/path");
+});
+```
+
+#### w.getAllCookies()
+
+Return every cookie currently in the webview's cookie store as a plain
+object of `{name: value, ...}`.  No host/path/secure filtering — useful
+when the page was loaded with `setHtml()` (and so has no resolvable
+host for `getCookies()` to filter against) or when you want to inspect
+the full store across origins.
+
+Available on macOS and on Linux when the underlying WebKitGTK ABI
+exports `webkit_cookie_manager_get_all_cookies` (true on Bullseye and
+newer, modern macOS).  Not available on Buster's stock WebKitGTK,
+where this property is simply absent from the webview object — guard
+with `typeof w.getAllCookies === "function"` if you need to support it.
+
+```javascript
+w.on("load", function() {
+    if (typeof w.getAllCookies === "function") {
+        var everything = w.getAllCookies();
+        console.log(Object.keys(everything).length, "cookies in store");
+    }
 });
 ```
 

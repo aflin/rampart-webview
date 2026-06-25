@@ -931,12 +931,45 @@ static duk_ret_t wv_snapshot(duk_context *ctx)
    ============================================================ */
 
 #include <libsoup/soup.h>
+#include <dlfcn.h>
 
 typedef struct {
     int    done;
     GList *cookies;
     GError *error;
 } cookie_op_t;
+
+/* webkit_cookie_manager_get_all_cookies(_finish) is the "dump entire
+   store" API, added upstream in WebKitGTK 2.20 (March 2018).  Some
+   distros ship a runtime libwebkit2gtk that doesn't export it (e.g.
+   Debian Buster's webkit2gtk-4.0 has the per-URI _get_cookies but not
+   _get_all_cookies).  Resolve via dlsym at first use; the getAllCookies
+   JS binding is only registered when both symbols are present.  No
+   compile-time reference to the symbol -- all calls go through the
+   function pointers below -- so the .so loads cleanly even under
+   BIND_NOW. */
+typedef void   (*webkit_get_all_cookies_fn)        (WebKitCookieManager *,
+                                                    GCancellable *,
+                                                    GAsyncReadyCallback,
+                                                    gpointer);
+typedef GList *(*webkit_get_all_cookies_finish_fn) (WebKitCookieManager *,
+                                                    GAsyncResult *,
+                                                    GError **);
+static webkit_get_all_cookies_fn        p_get_all_cookies        = NULL;
+static webkit_get_all_cookies_finish_fn p_get_all_cookies_finish = NULL;
+
+static int have_get_all_cookies(void)
+{
+    static int probed = 0;
+    if (!probed) {
+        probed = 1;
+        p_get_all_cookies = (webkit_get_all_cookies_fn)
+            dlsym(RTLD_DEFAULT, "webkit_cookie_manager_get_all_cookies");
+        p_get_all_cookies_finish = (webkit_get_all_cookies_finish_fn)
+            dlsym(RTLD_DEFAULT, "webkit_cookie_manager_get_all_cookies_finish");
+    }
+    return p_get_all_cookies && p_get_all_cookies_finish;
+}
 
 static void cookie_added_cb(GObject *src, GAsyncResult *res, gpointer data)
 {
@@ -977,10 +1010,17 @@ static duk_ret_t wv_set_cookie(duk_context *ctx)
     if (!uri || !*uri)
         RP_THROW(ctx, "webview.setCookie(): no current page (call setHtml or navigate first)");
 
-    /* Extract host from current URI */
+    /* Extract host from current URI.  GUri is GLib 2.66+ (Bullseye+);
+       fall back to SoupURI on older systems (e.g. Buster, glib 2.58). */
+#if GLIB_CHECK_VERSION(2,66,0)
     GUri *guri = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
     if (!guri) RP_THROW(ctx, "webview.setCookie(): failed to parse current URI");
     const char *host = g_uri_get_host(guri);
+#else
+    SoupURI *guri = soup_uri_new(uri);
+    if (!guri) RP_THROW(ctx, "webview.setCookie(): failed to parse current URI");
+    const char *host = soup_uri_get_host(guri);
+#endif
     if (!host || !*host) host = "localhost";
 
     SoupCookie *cookie = soup_cookie_new(name, value, host, "/", -1);
@@ -991,7 +1031,11 @@ static duk_ret_t wv_set_cookie(duk_context *ctx)
         g_main_context_iteration(NULL, TRUE);
 
     soup_cookie_free(cookie);
+#if GLIB_CHECK_VERSION(2,66,0)
     g_uri_unref(guri);
+#else
+    soup_uri_free(guri);
+#endif
 
     if (op.error) {
         char msg[512];
@@ -1002,17 +1046,34 @@ static duk_ret_t wv_set_cookie(duk_context *ctx)
     return 0;
 }
 
-static void cookie_get_all_cb(GObject *src, GAsyncResult *res, gpointer data)
+/* Finish callback for the per-URI get_cookies API.  Used by
+   getCookies(uri) -- always available on every WebKit2GTK we target. */
+static void cookie_get_for_uri_cb(GObject *src, GAsyncResult *res, gpointer data)
 {
     cookie_op_t *op = (cookie_op_t *)data;
-    op->cookies = webkit_cookie_manager_get_all_cookies_finish(
+    op->cookies = webkit_cookie_manager_get_cookies_finish(
         WEBKIT_COOKIE_MANAGER(src), res, &op->error);
     op->done = 1;
 }
 
+/* Finish callback for the whole-store get_all_cookies API.  Resolves
+   the finish symbol via dlsym so the file links cleanly on Buster's
+   stripped-down libwebkit2gtk where the symbol is absent. */
+static void cookie_get_all_cb(GObject *src, GAsyncResult *res, gpointer data)
+{
+    cookie_op_t *op = (cookie_op_t *)data;
+    op->cookies = p_get_all_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(src), res, &op->error);
+    op->done = 1;
+}
+
+/* getCookies([uri]) -- returns cookies that would be sent for `uri`
+   (or the current page URI if omitted).  Per-URI host/path/secure
+   filter applied by libsoup.  Available on every supported WebKit. */
 static duk_ret_t wv_get_cookies(duk_context *ctx)
 {
     REQUIRE_MAIN_THREAD(ctx);
+    const char *uri_arg = duk_is_string(ctx, 0) ? duk_get_string(ctx, 0) : NULL;
     webview_t w = get_wv(ctx);
 
     void *handle = webview_get_native_handle(w,
@@ -1020,20 +1081,72 @@ static duk_ret_t wv_get_cookies(duk_context *ctx)
     if (!handle) RP_THROW(ctx, "webview.getCookies(): no browser handle");
     WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
 
-    WebKitCookieManager *mgr = get_cookie_manager(wk, NULL);
+    const char *current_uri = NULL;
+    WebKitCookieManager *mgr = get_cookie_manager(wk, &current_uri);
     if (!mgr) RP_THROW(ctx, "webview.getCookies(): no cookie manager");
 
-    /* Return all cookies in the store (not filtered by URI).  This
-       matches the macOS implementation and avoids surprises when
-       setHtml changes the URL to an origin with no host. */
+    const char *uri = uri_arg ? uri_arg : current_uri;
+    if (!uri || !*uri)
+        RP_THROW(ctx, "webview.getCookies(): no URI "
+                      "(pass one or load a page first)");
+
     cookie_op_t op = { 0, NULL, NULL };
-    webkit_cookie_manager_get_all_cookies(mgr, NULL, cookie_get_all_cb, &op);
+    webkit_cookie_manager_get_cookies(mgr, uri, NULL, cookie_get_for_uri_cb, &op);
     while (!op.done)
         g_main_context_iteration(NULL, TRUE);
 
     if (op.error) {
         char msg[512];
         snprintf(msg, sizeof(msg), "webview.getCookies(): %s", op.error->message);
+        g_error_free(op.error);
+        if (op.cookies) g_list_free_full(op.cookies,
+            (GDestroyNotify)soup_cookie_free);
+        RP_THROW(ctx, "%s", msg);
+    }
+
+    duk_push_object(ctx);
+    for (GList *it = op.cookies; it; it = it->next) {
+        SoupCookie *c = (SoupCookie *)it->data;
+        const char *cn = soup_cookie_get_name(c);
+        const char *cv = soup_cookie_get_value(c);
+        if (cn && cv) {
+            duk_push_string(ctx, cv);
+            duk_put_prop_string(ctx, -2, cn);
+        }
+    }
+    if (op.cookies)
+        g_list_free_full(op.cookies, (GDestroyNotify)soup_cookie_free);
+
+    return 1;
+}
+
+/* getAllCookies() -- dumps the entire cookie store with no host or
+   path filtering.  Only registered when the underlying WebKit ABI
+   supports it (see have_get_all_cookies / registration block). */
+static duk_ret_t wv_get_all_cookies(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    if (!have_get_all_cookies())
+        RP_THROW(ctx, "webview.getAllCookies(): not supported on this "
+                      "WebKit (missing webkit_cookie_manager_get_all_cookies)");
+
+    webview_t w = get_wv(ctx);
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.getAllCookies(): no browser handle");
+    WebKitWebView *wk = WEBKIT_WEB_VIEW(handle);
+
+    WebKitCookieManager *mgr = get_cookie_manager(wk, NULL);
+    if (!mgr) RP_THROW(ctx, "webview.getAllCookies(): no cookie manager");
+
+    cookie_op_t op = { 0, NULL, NULL };
+    p_get_all_cookies(mgr, NULL, cookie_get_all_cb, &op);
+    while (!op.done)
+        g_main_context_iteration(NULL, TRUE);
+
+    if (op.error) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "webview.getAllCookies(): %s", op.error->message);
         g_error_free(op.error);
         if (op.cookies) g_list_free_full(op.cookies,
             (GDestroyNotify)soup_cookie_free);
@@ -1085,7 +1198,9 @@ extern unsigned char *rp_wkwebview_snapshot(void *wkwebview,
 extern void rp_wkwebview_set_user_agent(void *wkwebview, const char *ua);
 extern int  rp_wkwebview_set_cookie(void *wkwebview, const char *name,
                                      const char *value);
-extern char *rp_wkwebview_get_cookies(void *wkwebview);
+extern char *rp_wkwebview_get_cookies(void *wkwebview, const char *uri);
+extern char *rp_wkwebview_get_all_cookies(void *wkwebview);
+extern const char *rp_wkwebview_get_uri(void *wkwebview);
 
 static duk_ret_t wv_snapshot(duk_context *ctx)
 {
@@ -1147,16 +1262,45 @@ static duk_ret_t wv_set_cookie(duk_context *ctx)
     return 0;
 }
 
+/* getCookies([uri]) -- per-URI filter (current page if uri omitted).
+   Mirror of the Linux semantics. */
 static duk_ret_t wv_get_cookies(duk_context *ctx)
 {
     REQUIRE_MAIN_THREAD(ctx);
+    const char *uri_arg = duk_is_string(ctx, 0) ? duk_get_string(ctx, 0) : NULL;
     webview_t w = get_wv(ctx);
 
     void *handle = webview_get_native_handle(w,
         WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
     if (!handle) RP_THROW(ctx, "webview.getCookies(): no browser handle");
 
-    char *json = rp_wkwebview_get_cookies(handle);
+    const char *uri = uri_arg ? uri_arg : rp_wkwebview_get_uri(handle);
+    if (!uri || !*uri)
+        RP_THROW(ctx, "webview.getCookies(): no URI "
+                      "(pass one or load a page first)");
+
+    char *json = rp_wkwebview_get_cookies(handle, uri);
+    if (!json) {
+        duk_push_object(ctx);
+        return 1;
+    }
+    duk_push_string(ctx, json);
+    free(json);
+    duk_json_decode(ctx, -1);
+    return 1;
+}
+
+/* getAllCookies() -- whole cookie store. */
+static duk_ret_t wv_get_all_cookies(duk_context *ctx)
+{
+    REQUIRE_MAIN_THREAD(ctx);
+    webview_t w = get_wv(ctx);
+
+    void *handle = webview_get_native_handle(w,
+        WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
+    if (!handle) RP_THROW(ctx, "webview.getAllCookies(): no browser handle");
+
+    char *json = rp_wkwebview_get_all_cookies(handle);
     if (!json) {
         duk_push_object(ctx);
         return 1;
@@ -1169,6 +1313,7 @@ static duk_ret_t wv_get_cookies(duk_context *ctx)
 
 #define HAVE_SNAPSHOT 1
 #define HAVE_COOKIES 1
+#define HAVE_GET_ALL_COOKIES 1
 #define HAVE_USER_AGENT 1
 
 #endif /* snapshot platform */
@@ -2755,8 +2900,22 @@ duk_ret_t duk_open_module(duk_context *ctx)
 #ifdef HAVE_COOKIES
     duk_push_c_function(ctx, wv_set_cookie, 2);
     duk_put_prop_string(ctx, -2, "setCookie");
-    duk_push_c_function(ctx, wv_get_cookies, 0);
+    /* getCookies([uri]): per-URI filter, available everywhere.  Vararg
+       so the optional URI can be omitted. */
+    duk_push_c_function(ctx, wv_get_cookies, DUK_VARARGS);
     duk_put_prop_string(ctx, -2, "getCookies");
+    /* getAllCookies(): whole store.  Always present on macOS; on
+       Linux only when the WebKit ABI exports the symbol (not the case
+       on Buster's webkit2gtk-4.0). */
+#if defined(HAVE_GET_ALL_COOKIES)
+    duk_push_c_function(ctx, wv_get_all_cookies, 0);
+    duk_put_prop_string(ctx, -2, "getAllCookies");
+#else
+    if (have_get_all_cookies()) {
+        duk_push_c_function(ctx, wv_get_all_cookies, 0);
+        duk_put_prop_string(ctx, -2, "getAllCookies");
+    }
+#endif
 #endif
 
 #ifdef HAVE_USER_AGENT
