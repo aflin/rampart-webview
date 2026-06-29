@@ -1349,8 +1349,8 @@ static duk_ret_t wv_get_all_cookies(duk_context *ctx)
  *   JSC RegExp       → duk RegExp (with source and flags)
  *   JSC Error        → duk Error (with name and message)
  *   JSC Array        → duk Array (recursive)
- *   JSC Map          → duk Array of [key, value] pairs
- *   JSC Set          → duk Array of values
+ *   JSC Map          → duk Map (recursively converted entries)
+ *   JSC Set          → duk Set (recursively converted values)
  *   JSC Object       → duk Object (own enumerable properties, recursive)
  *   JSC Function     → duk string (toString representation)
  *   anything else    → duk string (toString fallback)

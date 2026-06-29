@@ -517,8 +517,8 @@ deep-converted to a native Duktape value with rich type mapping:
 | TypedArray (Uint8Array, Float64Array, etc.) | Matching Duktape TypedArray |
 | RegExp | Duktape RegExp (source + flags preserved) |
 | Error / TypeError / etc. | Duktape Error (name + message preserved) |
-| Map | Array of `[key, value]` pairs |
-| Set | Array of unique values |
+| Map | Duktape Map (`instanceof Map`; entries converted recursively) |
+| Set | Duktape Set (`instanceof Set`; values converted recursively) |
 | Array, Object | Recursive deep conversion |
 | Function | Its `toString()` source text |
 
