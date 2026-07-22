@@ -1,5 +1,12 @@
-# rampart-webview "oven" -- build rampart-webview.so on Debian 11 (Bullseye),
-# the OLDEST distro that ships the WebKit/GLib *dev headers* the source needs.
+# rampart-webview "oven" (wk40 variant) -- build rampart-webview_wk40.so against
+# webkit2gtk-4.0 on Debian 11 (Bullseye), the OLDEST distro that ships the
+# WebKit/GLib *dev headers* the source needs.
+#
+# Companion: Dockerfile.wk41 builds the webkit2gtk-4.1 variant on Debian 12.
+# 4.0 and 4.1 are the same WebKit API and both GTK3 -- they differ only in
+# libsoup (2 vs 3), hence different sonames.  Ubuntu 24.04 dropped 4.0, older
+# distros have only 4.0, so both are shipped and rampart-webview.js picks one
+# at first require().
 #
 # Debian 11 = GLib 2.66.8 (has GUri) + webkit2gtk-4.0 2.50.x (has the JSC
 # typed-array / ArrayBuffer APIs).  It is the earliest mainstream stable with

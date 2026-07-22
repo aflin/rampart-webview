@@ -1,0 +1,35 @@
+# rampart-webview "oven" (wk41 variant) -- build rampart-webview_wk41.so against
+# webkit2gtk-4.1 on Debian 12 (Bookworm).
+#
+# Why a second base: webkit2gtk-4.1 is the SAME WebKit API as 4.0 and is also
+# GTK3, but it links libsoup3 instead of libsoup2, so the resulting .so carries
+# different sonames:
+#     libwebkit2gtk-4.1.so.0 / libsoup-3.0.so.0 / libjavascriptcoregtk-4.1.so.0
+# Debian 11 has no libwebkit2gtk-4.1-dev, so the 4.1 variant needs Debian 12.
+#
+# Why it is needed at all: Ubuntu 24.04 removed webkit2gtk-4.0 entirely, so the
+# 4.0 build cannot load there; older distros ship only 4.0.  Both variants are
+# installed side by side and rampart-webview.js selects one at first require()
+# -- see that file for the full rationale.
+#
+# As with the 4.0 oven, the base does NOT meaningfully set the floor: the real
+# requirement is the target-supplied gtk/webkit/soup runtime stack.  Bookworm is
+# glibc 2.36, and every distro that ships webkit2gtk-4.1 (Ubuntu 22.04+,
+# Debian 12+, RHEL 9, Fedora) is at or above that.
+#
+# Built automatically by docker/build.sh wk41; or:
+#   docker build -f docker/Dockerfile.wk41 -t <tag> docker/
+FROM debian:12
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Debian 12's gcc 12 + cmake 3.25 are new enough; no separate toolset needed.
+# libwebkit2gtk-4.1-dev pulls GTK3 + the webkit2gtk-4.1 API (libsoup3).  The
+# resulting .so NEEDs libgtk-3 / libwebkit2gtk-4.1 at runtime -- inherent to a
+# webview module; the target supplies them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git pkg-config \
+        libgtk-3-dev libwebkit2gtk-4.1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# No ENTRYPOINT: docker/build.sh invokes docker/build-in-oven.sh explicitly.

@@ -22,6 +22,14 @@ set(RAMPART_BIN "/usr/local/rampart/bin" CACHE PATH "Rampart bin directory (for 
 set(WEBVIEW_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview")
 set(WEBVIEW_INCLUDE_DIR "${WEBVIEW_SOURCE_DIR}/core/include")
 
+# Module filename suffix, used ONLY by the Linux docker ("oven") builds to emit
+# the per-WebKitGTK variants: -DMODSUFFIX=_wk41 -> rampart-webview_wk41.so.
+# Empty (the default) keeps the plain rampart-webview.so that native macOS /
+# FreeBSD / Linux builds produce -- those are deliberately unchanged.
+# Named MODSUFFIX, not SUFFIX, to avoid confusion with the
+# set_target_properties(... SUFFIX ".so") shared-library extension below.
+set(MODSUFFIX "" CACHE STRING "module filename suffix, e.g. _wk41 (docker variant builds)")
+
 # The module shared library
 if(APPLE)
     add_library(rampart-webview SHARED rampart-webview.c snapshot_macos.m)
@@ -32,12 +40,14 @@ else()
     add_library(rampart-webview SHARED rampart-webview.c)
 endif()
 
-# Output must always be rampart-webview.so regardless of platform.
+# Output is rampart-webview.so on every platform for a native build; the Linux
+# ovens set MODSUFFIX to emit rampart-webview_wk40.so / _wk41.so alongside the
+# rampart-webview.js selector.
 # Use C++ linker because libwebview.a contains C++ object code.
 set_target_properties(rampart-webview PROPERTIES
     PREFIX ""
     SUFFIX ".so"
-    OUTPUT_NAME "rampart-webview"
+    OUTPUT_NAME "rampart-webview${MODSUFFIX}"
     LINKER_LANGUAGE CXX
 )
 
@@ -132,3 +142,16 @@ endif()
 install(TARGETS rampart-webview
     LIBRARY DESTINATION "${RAMPART_MODULES_PATH}"
 )
+
+# Variant (Linux docker) builds also ship the selector shim, which picks the
+# .so matching the host's WebKitGTK at first require().  The loader tries
+# .js before .so (src/duktape/core/module.c), so rampart-webview.js
+# transparently fronts require("rampart-webview").
+#
+# Native builds (MODSUFFIX empty) install a plain rampart-webview.so and must
+# NOT get the shim -- it would look for _wk40/_wk41 variants that don't exist.
+if(NOT MODSUFFIX STREQUAL "")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/rampart-webview.js"
+        DESTINATION "${RAMPART_MODULES_PATH}"
+    )
+endif()
